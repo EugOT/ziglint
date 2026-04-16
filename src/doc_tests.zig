@@ -99,12 +99,12 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
     @memcpy(source, doc_test.code);
 
     // Write to temp file for semantic analysis
-    try tmp_dir.dir.writeFile(.{ .sub_path = "doc_test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(allocator, "doc_test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "doc_test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "doc_test.zig", allocator);
     defer allocator.free(path);
 
     // Try to create ModuleGraph for semantic analysis (may fail for invalid code)
-    var graph: ?ModuleGraph = ModuleGraph.init(allocator, path, null) catch null;
+    var graph: ?ModuleGraph = ModuleGraph.init(allocator, std.testing.io, path, null) catch null;
     defer if (graph) |*g| g.deinit();
 
     var resolver: ?TypeResolver = if (graph) |*g| TypeResolver.init(allocator, g) else null;
@@ -152,14 +152,14 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
 pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
     // Open docs/rules directory
     const docs_path = "docs/rules";
-    var dir = std.fs.cwd().openDir(docs_path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(std.testing.io, docs_path, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("No docs/rules directory found, skipping doc tests\n", .{});
             return;
         }
         return err;
     };
-    defer dir.close();
+    defer dir.close(std.testing.io);
 
     // Create temp directory for semantic analysis
     var tmp_dir = std.testing.tmpDir(.{});
@@ -168,14 +168,11 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
     var file_count: usize = 0;
     var test_count: usize = 0;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
 
-        const file = try dir.openFile(entry.name, .{});
-        defer file.close();
-
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try dir.readFileAlloc(std.testing.io, entry.name, allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
         const doc = try parseMarkdown(allocator, content);

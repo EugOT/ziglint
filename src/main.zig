@@ -1,7 +1,6 @@
 //! ziglint - A linter for Zig source code
 
 const std = @import("std");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const version = build_options.version;
 
@@ -20,23 +19,21 @@ pub const Config = struct {
     verbose: bool = false,
 };
 
-pub fn main() !u8 {
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+pub fn main(init: std.process.Init) !u8 {
+    const allocator = init.arena.allocator();
+    const io = init.io;
 
-    const stderr_file = std.fs.File.stderr();
-    const use_color = detectColorSupport(stderr_file);
-
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buf);
-    defer stdout.end() catch {};
+    const stderr_file = std.Io.File.stderr();
+    const use_color = detectColorSupport(io, stderr_file, init.environ_map);
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr = stderr_file.writer(&stderr_buf);
-    defer stderr.end() catch {};
+    var stderr_writer = stderr_file.writer(io, &stderr_buf);
+    const stderr = &stderr_writer.interface;
+    defer stderr.flush() catch {};
 
-    var config = parseArgs(allocator, &stderr.interface) catch |err| switch (err) {
+    const args = try init.minimal.args.toSlice(allocator);
+
+    var config = parseArgs(allocator, args, stderr) catch |err| switch (err) {
         error.HelpOrVersion => return 0,
         error.InvalidArgs => return 1,
         else => return err,
@@ -44,7 +41,7 @@ pub fn main() !u8 {
 
     // Load config file from first CLI path (or current directory)
     const start_path = if (config.paths.len > 0) config.paths[0] else null;
-    config.file_config = FileConfig.load(allocator, start_path) catch .{};
+    config.file_config = FileConfig.load(allocator, io, start_path) catch .{};
 
     applyOnlyRules(&config);
 
@@ -57,15 +54,15 @@ pub fn main() !u8 {
         }
     }
 
-    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, &stderr.interface) catch null;
+    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, io, stderr) catch null;
 
     var total_timer = if (config.verbose) std.time.Timer.start() catch null else null;
 
     var total_issues: usize = 0;
     for (config.paths) |path| {
-        const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch path;
-        const project_root = findProjectRoot(abs_path);
-        total_issues += try lintPath(allocator, path, zig_lib_path, &config, use_color, project_root, &stderr.interface);
+        const abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch path;
+        const project_root = findProjectRoot(io, abs_path);
+        total_issues += try lintPath(allocator, io, path, zig_lib_path, &config, use_color, project_root, stderr);
     }
 
     if (config.verbose and total_timer != null) {
@@ -79,28 +76,22 @@ pub fn main() !u8 {
     return if (total_issues > 0) 1 else 0;
 }
 
-fn detectColorSupport(file: std.fs.File) bool {
-    const native = builtin.os.tag;
+fn detectColorSupport(io: std.Io, file: std.Io.File, environ_map: *const std.process.Environ.Map) bool {
     // NO_COLOR takes precedence (https://no-color.org/)
-    if (native == .windows) {
-        if (std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("NO_COLOR"))) |_| return false;
-        if (std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("FORCE_COLOR"))) |_| return true;
-    } else {
-        if (std.posix.getenv("NO_COLOR")) |_| return false;
-        if (std.posix.getenv("FORCE_COLOR")) |_| return true;
-    }
+    if (environ_map.get("NO_COLOR") != null) return false;
+    if (environ_map.get("FORCE_COLOR") != null) return true;
     // Otherwise, use color if stdout is a TTY
-    return file.isTty();
+    return file.isTty(io) catch false;
 }
 
-fn findProjectRoot(start_path: []const u8) ?[]const u8 {
+fn findProjectRoot(io: std.Io, start_path: []const u8) ?[]const u8 {
     var path = start_path;
     while (true) {
         // Check if build.zig exists in this directory
         const build_zig = std.fs.path.join(std.heap.page_allocator, &.{ path, "build.zig" }) catch return null;
         defer std.heap.page_allocator.free(build_zig);
 
-        if (std.fs.cwd().access(build_zig, .{})) |_| {
+        if (std.Io.Dir.cwd().access(io, build_zig, .{})) |_| {
             return std.heap.page_allocator.dupe(u8, path) catch null;
         } else |_| {}
 
@@ -124,9 +115,7 @@ fn makeRelativePath(path: []const u8, project_root: ?[]const u8) []const u8 {
     return path;
 }
 
-fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
-    const args = try std.process.argsAlloc(allocator);
-
+fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8, writer: *std.Io.Writer) !Config {
     var config: Config = .{};
     var paths: std.ArrayList([]const u8) = .empty;
     var only_rules: std.ArrayList(rules.Rule) = .empty;
@@ -215,28 +204,24 @@ fn applyOnlyRules(config: *Config) void {
     }
 }
 
-fn detectZigLibPath(allocator: std.mem.Allocator, writer: *std.Io.Writer) !?[]const u8 {
-    var child: std.process.Child = .init(&.{ "zig", "env" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch |err| {
+fn detectZigLibPath(allocator: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer) !?[]const u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "zig", "env" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4 * 1024),
+    }) catch |err| {
         try writer.print("warning: could not run 'zig env': {}\n", .{err});
         return null;
     };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
-    var buf: [64 * 1024]u8 = undefined;
-    const stdout = child.stdout orelse return null;
-    const len = stdout.readAll(&buf) catch return null;
-    const output = buf[0..len];
-
-    const term = child.wait() catch return null;
-    switch (term) {
-        .Exited => |code| if (code != 0) return null,
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
-    return parseLibDirFromZigEnv(allocator, output);
+    return parseLibDirFromZigEnv(allocator, result.stdout);
 }
 
 fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]const u8 {
@@ -247,30 +232,27 @@ fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]co
     return allocator.dupe(u8, output[value_start..end_idx]) catch null;
 }
 
-fn lintPath(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
-    const stat = std.fs.cwd().statFile(path) catch |err| {
-        if (err == error.IsDir) {
-            return lintDirectory(allocator, path, zig_lib_path, config, use_color, project_root, writer);
-        }
+fn lintPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
         try writer.print("error: cannot access '{s}': {}\n", .{ path, err });
         return 0;
     };
 
     if (stat.kind == .directory) {
-        return lintDirectory(allocator, path, zig_lib_path, config, use_color, project_root, writer);
+        return lintDirectory(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
     }
 
-    return lintFile(allocator, path, zig_lib_path, config, use_color, project_root, writer);
+    return lintFile(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
 }
 
-fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         try writer.print("error: cannot open directory '{s}': {}\n", .{ path, err });
         return 0;
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    const gitignore = loadGitignore(allocator, dir);
+    const gitignore = loadGitignore(allocator, io, dir);
     defer if (gitignore) |g| allocator.free(g);
 
     // Collect all .zig files first
@@ -286,7 +268,7 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
     };
     defer walker.deinit();
 
-    while (walker.next() catch null) |entry| {
+    while (walker.next(io) catch null) |entry| {
         if (shouldSkip(entry.path, gitignore)) continue;
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
@@ -312,14 +294,14 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
 
     // Build module graph once using first file as root, then add all others
     const graph_start = if (timer) |*t| t.read() else 0;
-    var graph = ModuleGraph.init(allocator, files.items[0], zig_lib_path) catch {
+    var graph = ModuleGraph.init(allocator, io, files.items[0], zig_lib_path) catch {
         // Fall back to per-file linting without semantics
         if (config.verbose) {
             try writer.print("{s}│ module graph failed, using simple linting{s}\n", .{ dim, reset });
         }
         var total: usize = 0;
         for (files.items) |file_path| {
-            total += try lintFileSimple(allocator, file_path, config, use_color, project_root, writer);
+            total += try lintFileSimple(allocator, io, file_path, config, use_color, project_root, writer);
         }
         return total;
     };
@@ -352,7 +334,7 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
 
     var total: usize = 0;
     for (files.items) |file_path| {
-        total += try lintFileWithGraph(allocator, file_path, &graph, &resolver, config, use_color, project_root, writer);
+        total += try lintFileWithGraph(allocator, io, file_path, &graph, &resolver, config, use_color, project_root, writer);
     }
 
     if (config.verbose and timer != null) {
@@ -401,11 +383,11 @@ fn matchesGitignore(path: []const u8, pattern: []const u8) bool {
     return std.mem.indexOf(u8, path, clean_pattern) != null;
 }
 
-fn loadGitignore(allocator: std.mem.Allocator, dir: std.fs.Dir) ?[]const u8 {
-    return dir.readFileAlloc(allocator, ".gitignore", 1024 * 64) catch null;
+fn loadGitignore(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ?[]const u8 {
+    return dir.readFileAlloc(io, ".gitignore", allocator, .limited(1024 * 64)) catch null;
 }
 
-fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+fn lintFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     var timer = if (config.verbose) std.time.Timer.start() catch null else null;
 
     const dim = if (use_color) "\x1b[2m" else "";
@@ -417,8 +399,8 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]con
     }
 
     const graph_start = if (timer) |*t| t.read() else 0;
-    var graph = ModuleGraph.init(allocator, path, zig_lib_path) catch {
-        return lintFileSimple(allocator, path, config, use_color, project_root, writer);
+    var graph = ModuleGraph.init(allocator, io, path, zig_lib_path) catch {
+        return lintFileSimple(allocator, io, path, config, use_color, project_root, writer);
     };
     defer graph.deinit();
 
@@ -436,7 +418,7 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]con
         try writer.print("{s}│ type resolver: {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
-    const result = try lintFileWithGraph(allocator, path, &graph, &resolver, config, use_color, project_root, writer);
+    const result = try lintFileWithGraph(allocator, io, path, &graph, &resolver, config, use_color, project_root, writer);
 
     if (config.verbose and timer != null) {
         const total = timer.?.read();
@@ -446,12 +428,12 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]con
     return result;
 }
 
-fn lintFileSimple(allocator: std.mem.Allocator, path: []const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
-    const source = std.fs.cwd().readFileAllocOptions(
-        allocator,
+fn lintFileSimple(allocator: std.mem.Allocator, io: std.Io, path: []const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        io,
         path,
-        1024 * 1024 * 16,
-        null,
+        allocator,
+        .limited(1024 * 1024 * 16),
         .@"1",
         0,
     ) catch |err| {
@@ -466,9 +448,9 @@ fn lintFileSimple(allocator: std.mem.Allocator, path: []const u8, config: *const
     return writeDiagnostics(linter.diagnostics.items, config, use_color, project_root, writer);
 }
 
-fn lintFileWithGraph(allocator: std.mem.Allocator, path: []const u8, graph: *ModuleGraph, resolver: *TypeResolver, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+fn lintFileWithGraph(allocator: std.mem.Allocator, io: std.Io, path: []const u8, graph: *ModuleGraph, resolver: *TypeResolver, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     const mod = graph.getModule(path) orelse {
-        return lintFileSimple(allocator, path, config, use_color, project_root, writer);
+        return lintFileSimple(allocator, io, path, config, use_color, project_root, writer);
     };
 
     const dim = if (use_color) "\x1b[2m" else "";

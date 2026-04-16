@@ -87,16 +87,14 @@ fn addPathInputs(b: *std.Build, run: *std.Build.Step.Run, lazy_path: std.Build.L
         else => return,
     };
 
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const full_path = src.owner.build_root.handle.realpathZ(@ptrCast(src.sub_path), &buf) catch return;
-
-    const stat = std.fs.cwd().statFile(full_path) catch return;
+    const io = src.owner.graph.io;
+    const stat = src.owner.build_root.handle.statFile(io, src.sub_path, .{}) catch return;
     if (stat.kind == .directory) {
-        var dir = std.fs.cwd().openDir(full_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = src.owner.build_root.handle.openDir(io, src.sub_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
         var walker = dir.walk(b.allocator) catch return;
         defer walker.deinit();
-        while (walker.next() catch null) |entry| {
+        while (walker.next(io) catch null) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".zig")) {
                 run.addFileInput(lazy_path.path(run.step.owner, entry.path));
             }
@@ -108,7 +106,7 @@ fn addPathInputs(b: *std.Build, run: *std.Build.Step.Run, lazy_path: std.Build.L
 
 fn getVersion(b: *std.Build) []const u8 {
     var code: u8 = undefined;
-    const git_describe = b.runAllowFail(&.{ "git", "describe", "--match", "v*.*.*", "--tags" }, &code, .Ignore) catch {
+    const git_describe = b.runAllowFail(&.{ "git", "describe", "--match", "v*.*.*", "--tags" }, &code, .ignore) catch {
         return "unknown";
     };
     const trimmed = std.mem.trim(u8, git_describe, " \n\r");

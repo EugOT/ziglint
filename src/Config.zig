@@ -39,28 +39,28 @@ pub fn setRuleEnabled(self: *Config, rule: Rule, enabled: bool) void {
 }
 
 /// Load config from .ziglint.zon file, searching from start_path up to root.
-pub fn load(allocator: std.mem.Allocator, start_path: ?[]const u8) !Config {
-    const config_path = try findConfigFile(allocator, start_path) orelse return .{};
+pub fn load(allocator: std.mem.Allocator, io: std.Io, start_path: ?[]const u8) !Config {
+    const config_path = try findConfigFile(allocator, io, start_path) orelse return .{};
     defer allocator.free(config_path);
 
-    return parseConfigFile(allocator, config_path) catch |err| {
+    return parseConfigFile(allocator, io, config_path) catch |err| {
         std.debug.print("warning: failed to parse {s}: {}\n", .{ config_path, err });
         return .{};
     };
 }
 
 /// Find .ziglint.zon by walking up from start_path.
-fn findConfigFile(allocator: std.mem.Allocator, start_path: ?[]const u8) !?[]const u8 {
+fn findConfigFile(allocator: std.mem.Allocator, io: std.Io, start_path: ?[]const u8) !?[]const u8 {
     const path = start_path orelse {
-        return findConfigInDir(allocator, ".");
+        return findConfigInDir(allocator, io, ".");
     };
 
-    const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch path;
+    const abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch path;
     defer if (abs_path.ptr != path.ptr) allocator.free(abs_path);
 
     var current = abs_path;
     while (true) {
-        if (try findConfigInDir(allocator, current)) |config_path| {
+        if (try findConfigInDir(allocator, io, current)) |config_path| {
             return config_path;
         }
 
@@ -72,11 +72,11 @@ fn findConfigFile(allocator: std.mem.Allocator, start_path: ?[]const u8) !?[]con
     return null;
 }
 
-fn findConfigInDir(allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
+fn findConfigInDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !?[]const u8 {
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, ".ziglint.zon" });
     errdefer allocator.free(config_path);
 
-    std.fs.cwd().access(config_path, .{}) catch {
+    std.Io.Dir.cwd().access(io, config_path, .{}) catch {
         allocator.free(config_path);
         return null;
     };
@@ -90,12 +90,12 @@ const ZonConfig = struct {
     rules: ?Rule.Config = null,
 };
 
-fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const source = try std.fs.cwd().readFileAllocOptions(
-        allocator,
+fn parseConfigFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
+    const source = try std.Io.Dir.cwd().readFileAllocOptions(
+        io,
         path,
-        1024 * 1024,
-        null,
+        allocator,
+        .limited(1024 * 1024),
         .@"1",
         0,
     );
@@ -105,7 +105,7 @@ fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !Config {
 }
 
 fn parseConfigSource(allocator: std.mem.Allocator, source: [:0]const u8) !Config {
-    const zon_config = std.zon.parse.fromSlice(ZonConfig, allocator, source, null, .{}) catch {
+    const zon_config = std.zon.parse.fromSliceAlloc(ZonConfig, allocator, source, null, .{}) catch {
         return error.ParseError;
     };
     defer std.zon.parse.free(allocator, zon_config);

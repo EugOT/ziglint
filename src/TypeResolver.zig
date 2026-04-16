@@ -440,7 +440,7 @@ fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, mod
                         if (std.mem.endsWith(u8, import_str, ".zig")) {
                             const module_dir = std.fs.path.dirname(module_path) orelse ".";
                             const resolved = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch continue;
-                            const canonical = std.fs.cwd().realpathAlloc(self.allocator, resolved) catch {
+                            const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.graph.io, resolved, self.allocator) catch {
                                 self.allocator.free(resolved);
                                 continue;
                             };
@@ -1189,11 +1189,11 @@ test "resolve primitive types" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1216,11 +1216,11 @@ test "resolve bool literal" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1241,11 +1241,11 @@ test "resolve import std" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1265,11 +1265,11 @@ test "resolve function returns type" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1289,11 +1289,11 @@ test "resolve number literal int" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1314,11 +1314,11 @@ test "resolve number literal float" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1342,11 +1342,11 @@ test "resolve field access on std" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1372,11 +1372,11 @@ test "resolve nested field access std.fs.File" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1402,11 +1402,11 @@ test "resolve field access on aliased std import" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1432,11 +1432,11 @@ test "resolve nested field access on aliased std import" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1459,11 +1459,11 @@ test "resolve string literal" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1483,11 +1483,11 @@ test "resolve function declaration" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1511,11 +1511,11 @@ test "find method in user type" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1538,11 +1538,11 @@ test "find method not found returns null" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1558,12 +1558,12 @@ test "find method in std_type without zig_lib_path returns null" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = "const x = 1;" });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = "const x = 1;" });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     // No zig_lib_path, so stdlib can't be resolved
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1586,11 +1586,11 @@ test "resolve function call return type" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1613,11 +1613,11 @@ test "resolve function call returning bool" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1644,11 +1644,11 @@ test "resolve method call return type" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1671,11 +1671,11 @@ test "resolve type-returning function call" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1694,11 +1694,11 @@ test "resolve unknown function call" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1715,11 +1715,11 @@ test "isTypeRef: struct declaration" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1738,11 +1738,11 @@ test "isTypeRef: instance with type annotation" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1759,11 +1759,11 @@ test "isTypeRef: primitive typed variable" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1779,11 +1779,11 @@ test "isTypeRef: explicit type annotation" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1799,11 +1799,11 @@ test "isTypeRef: enum declaration" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1824,11 +1824,11 @@ test "isTypeRef: function call returning type" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1849,11 +1849,11 @@ test "isTypeRef: function call returning value" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1872,11 +1872,11 @@ test "isTypeRef: identifier resolving to struct" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1898,11 +1898,11 @@ test "isTypeRef: identifier resolving to instance" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1926,11 +1926,11 @@ test "findFnInCurrentModule: type function" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1949,11 +1949,11 @@ test "findFnInCurrentModule: direct function" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1973,11 +1973,11 @@ test "findFnInCurrentModule: const alias to function" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);

@@ -51,27 +51,21 @@ pub const Rule = enum(u16) {
 
     pub const Config = blk: {
         const enum_fields = @typeInfo(Rule).@"enum".fields;
-        var struct_fields: [enum_fields.len]std.builtin.Type.StructField = undefined;
+        var field_names: [enum_fields.len][:0]const u8 = undefined;
+        var field_types: [enum_fields.len]type = undefined;
+        var field_attrs: [enum_fields.len]std.builtin.Type.StructField.Attributes = undefined;
+
         for (enum_fields, 0..) |field, i| {
             const rule: Rule = @enumFromInt(field.value);
             const ConfigT = rule.ConfigType();
             const default_value: ConfigT = .{};
-            struct_fields[i] = .{
-                .name = field.name,
-                .type = ConfigT,
+            field_names[i] = field.name;
+            field_types[i] = ConfigT;
+            field_attrs[i] = .{
                 .default_value_ptr = @ptrCast(&default_value),
-                .is_comptime = false,
-                .alignment = @alignOf(ConfigT),
             };
         }
-        break :blk @Type(.{
-            .@"struct" = .{
-                .layout = .auto,
-                .fields = &struct_fields,
-                .decls = &.{},
-                .is_tuple = false,
-            },
-        });
+        break :blk @Struct(.auto, null, &field_names, &field_types, &field_attrs);
     };
 
     pub fn code(self: Rule) []const u8 {
@@ -313,29 +307,28 @@ fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, type_col
 fn RuleConfig(comptime enabled_by_default: bool, comptime Extra: type) type {
     const extra_fields = @typeInfo(Extra).@"struct".fields;
 
-    var fields: [1 + extra_fields.len]std.builtin.Type.StructField = undefined;
+    var field_names: [1 + extra_fields.len][:0]const u8 = undefined;
+    var field_types: [1 + extra_fields.len]type = undefined;
+    var field_attrs: [1 + extra_fields.len]std.builtin.Type.StructField.Attributes = undefined;
 
     const default_enabled: bool = enabled_by_default;
-    fields[0] = .{
-        .name = "enabled",
-        .type = bool,
+    field_names[0] = "enabled";
+    field_types[0] = bool;
+    field_attrs[0] = .{
         .default_value_ptr = @ptrCast(&default_enabled),
-        .is_comptime = false,
-        .alignment = @alignOf(bool),
     };
 
     for (extra_fields, 0..) |f, i| {
-        fields[1 + i] = f;
+        field_names[1 + i] = f.name;
+        field_types[1 + i] = f.type;
+        field_attrs[1 + i] = .{
+            .@"comptime" = f.is_comptime,
+            .@"align" = f.alignment,
+            .default_value_ptr = f.default_value_ptr,
+        };
     }
 
-    return @Type(.{
-        .@"struct" = .{
-            .layout = .auto,
-            .fields = &fields,
-            .decls = &.{},
-            .is_tuple = false,
-        },
-    });
+    return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
 }
 
 test "rule codes" {

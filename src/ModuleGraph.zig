@@ -11,22 +11,24 @@ const AstGen = std.zig.AstGen;
 const ModuleGraph = @This();
 
 allocator: std.mem.Allocator,
+io: std.Io,
 zig_lib_path: ?[]const u8,
 root_dir: []const u8,
 modules: std.StringHashMapUnmanaged(Module),
 
 pub const Module = struct {
-    path: []const u8,
+    path: [:0]const u8,
     source: [:0]const u8,
     tree: Ast,
     zir: ?Zir = null,
 };
 
-pub fn init(allocator: std.mem.Allocator, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
     const root_dir = std.fs.path.dirname(root_source) orelse ".";
 
     var graph: ModuleGraph = .{
         .allocator = allocator,
+        .io = io,
         .zig_lib_path = zig_lib_path,
         .root_dir = root_dir,
         .modules = .empty,
@@ -54,18 +56,18 @@ pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {
 }
 
 fn addModule(self: *ModuleGraph, path: []const u8) !void {
-    const canonical = try std.fs.cwd().realpathAlloc(self.allocator, path);
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
 
     if (self.modules.contains(canonical)) {
         self.allocator.free(canonical);
         return;
     }
 
-    const source = std.fs.cwd().readFileAllocOptions(
-        self.allocator,
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        self.io,
         canonical,
-        1024 * 1024 * 16,
-        null,
+        self.allocator,
+        .limited(1024 * 1024 * 16),
         .@"1",
         0,
     ) catch |err| {
@@ -234,7 +236,7 @@ pub fn moduleCount(self: *const ModuleGraph) usize {
 }
 
 pub fn getModule(self: *const ModuleGraph, path: []const u8) ?*const Module {
-    const canonical = std.fs.cwd().realpathAlloc(self.allocator, path) catch return null;
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator) catch return null;
     defer self.allocator.free(canonical);
     return self.modules.getPtr(canonical);
 }
@@ -258,12 +260,12 @@ test "parse simple module" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = source });
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = source });
 
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(1, graph.moduleCount());
@@ -273,13 +275,13 @@ test "resolve relative import" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "const utils = @import(\"utils.zig\");" });
-    try tmp_dir.dir.writeFile(.{ .sub_path = "utils.zig", .data = "pub fn helper() void {}" });
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "const utils = @import(\"utils.zig\");" });
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "utils.zig", .data = "pub fn helper() void {}" });
 
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(2, graph.moduleCount());
@@ -289,12 +291,12 @@ test "handle missing import gracefully" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "const missing = @import(\"nonexistent.zig\");" });
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "const missing = @import(\"nonexistent.zig\");" });
 
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(1, graph.moduleCount());
@@ -304,17 +306,17 @@ test "no duplicate modules" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = 
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data =
         \\const a = @import("shared.zig");
         \\const b = @import("other.zig");
     });
-    try tmp_dir.dir.writeFile(.{ .sub_path = "other.zig", .data = "const shared = @import(\"shared.zig\");" });
-    try tmp_dir.dir.writeFile(.{ .sub_path = "shared.zig", .data = "pub const x = 1;" });
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "other.zig", .data = "const shared = @import(\"shared.zig\");" });
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "shared.zig", .data = "pub const x = 1;" });
 
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
     defer graph.deinit();
 
     // main.zig, other.zig, shared.zig - no duplicates
@@ -327,12 +329,12 @@ test "no duplicate modules" {
 //     var tmp_dir = std.testing.tmpDir(.{});
 //     defer tmp_dir.cleanup();
 
-//     try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "pub fn main() void {}" });
+//     try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "pub fn main() void {}" });
 
-//     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+//     const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
 //     defer std.testing.allocator.free(path);
 
-//     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+//     var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
 //     defer graph.deinit();
 
 //     try std.testing.expectEqual(1, graph.moduleCount());
@@ -347,12 +349,12 @@ test "no duplicate modules" {
 //     var tmp_dir = std.testing.tmpDir(.{});
 //     defer tmp_dir.cleanup();
 
-//     try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "fn broken( {}" });
+//     try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "fn broken( {}" });
 
-//     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+//     const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
 //     defer std.testing.allocator.free(path);
 
-//     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+//     var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
 //     defer graph.deinit();
 
 //     try std.testing.expectEqual(1, graph.moduleCount());
