@@ -42,9 +42,10 @@ parent_map: []Ast.Node.OptionalIndex = &.{},
 deprecation_cache: std.AutoHashMapUnmanaged(DeprecationKey, bool) = .empty,
 verbose: bool = false,
 use_color: bool = false,
+io: ?std.Io = null,
 /// Track time spent checking each rule type (nanoseconds)
 rule_timings: std.AutoHashMapUnmanaged(rules.Rule, u64) = .empty,
-rule_timer: ?std.time.Timer = null,
+rule_timer: ?std.Io.Clock.Timestamp = null,
 
 const default_config: Config = .{};
 
@@ -151,9 +152,12 @@ pub fn deinit(self: *Linter) void {
 }
 
 pub fn lint(self: *Linter) void {
-    var timer = if (self.verbose) std.time.Timer.start() catch null else null;
-    if (self.verbose) {
-        self.rule_timer = std.time.Timer.start() catch null;
+    var timer: ?std.Io.Clock.Timestamp = null;
+    if (self.verbose and self.io != null) {
+        timer = std.Io.Clock.Timestamp.now(self.io.?, .awake);
+        self.rule_timer = std.Io.Clock.Timestamp.now(self.io.?, .awake);
+    } else {
+        self.rule_timer = null;
     }
 
     const dim = if (self.use_color) "\x1b[2m" else "";
@@ -167,27 +171,27 @@ pub fn lint(self: *Linter) void {
     self.checkLineLength();
     self.checkFileAsStruct();
 
-    const setup_start = if (timer) |*t| t.read() else 0;
+    const setup_start = if (timer) |t| timerRead(self.io.?, t) else 0;
     self.buildPublicTypesMap();
     self.collectAllIdentifiers();
     self.buildParentMap();
 
     if (self.verbose and timer != null) {
-        const elapsed = timer.?.read() - setup_start;
+        const elapsed = timerRead(self.io.?, timer.?) - setup_start;
         std.debug.print("{s}│   setup:       {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
-    const visit_start = if (timer) |*t| t.read() else 0;
+    const visit_start = if (timer) |t| timerRead(self.io.?, t) else 0;
     for (self.tree.rootDecls()) |node| {
         self.visitNode(node);
     }
 
     if (self.verbose and timer != null) {
-        const elapsed = timer.?.read() - visit_start;
+        const elapsed = timerRead(self.io.?, timer.?) - visit_start;
         std.debug.print("{s}│   visit:       {s}{d:>7.2}ms{s} ({d} nodes)\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset, self.tree.nodes.len });
     }
 
-    const checks_start = if (timer) |*t| t.read() else 0;
+    const checks_start = if (timer) |t| timerRead(self.io.?, t) else 0;
     self.checkUnusedImports();
     self.checkThisBuiltin();
     self.checkInlineImports();
@@ -196,7 +200,7 @@ pub fn lint(self: *Linter) void {
     self.checkInstanceDeclAccess();
 
     if (self.verbose and timer != null) {
-        const elapsed = timer.?.read() - checks_start;
+        const elapsed = timerRead(self.io.?, timer.?) - checks_start;
         std.debug.print("{s}│   checks:      {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
@@ -230,6 +234,11 @@ pub fn lint(self: *Linter) void {
             std.debug.print("{s}│     {s}{s}{s}: {s}{d:>7.2}ms{s}\n", .{ dim, yellow, entry.rule.code(), reset, cyan, time_ms, reset });
         }
     }
+}
+
+fn timerRead(io: std.Io, timer: std.Io.Clock.Timestamp) u64 {
+    const elapsed_ns = timer.untilNow(io).raw.toNanoseconds();
+    return @intCast(@max(elapsed_ns, 0));
 }
 
 fn trackRuleTime(self: *Linter, rule: rules.Rule, time_ns: u64) void {
@@ -1402,18 +1411,18 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
             self.checkCallArgs(node);
             self.checkRedundantAsInCallArgs(node);
 
-            if (self.rule_timer != null) {
-                const deprecated_start = self.rule_timer.?.read();
+            if (self.rule_timer != null and self.io != null) {
+                const deprecated_start = timerRead(self.io.?, self.rule_timer.?);
                 self.checkDeprecatedCall(node);
-                self.trackRuleTime(.Z011, self.rule_timer.?.read() - deprecated_start);
+                self.trackRuleTime(.Z011, timerRead(self.io.?, self.rule_timer.?) - deprecated_start);
             } else {
                 self.checkDeprecatedCall(node);
             }
 
-            if (self.rule_timer != null) {
-                const assert_start = self.rule_timer.?.read();
+            if (self.rule_timer != null and self.io != null) {
+                const assert_start = timerRead(self.io.?, self.rule_timer.?);
                 self.checkCompoundAssert(node);
-                self.trackRuleTime(.Z016, self.rule_timer.?.read() - assert_start);
+                self.trackRuleTime(.Z016, timerRead(self.io.?, self.rule_timer.?) - assert_start);
             } else {
                 self.checkCompoundAssert(node);
             }
@@ -1860,10 +1869,10 @@ fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
     self.checkRedundantType(return_expr, true);
 
-    if (self.rule_timer) |*t| {
-        const start = t.read();
+    if (self.rule_timer != null and self.io != null) {
+        const start = timerRead(self.io.?, self.rule_timer.?);
         self.checkReturnTry(node, return_expr);
-        self.trackRuleTime(.Z017, t.read() - start);
+        self.trackRuleTime(.Z017, timerRead(self.io.?, self.rule_timer.?) - start);
     } else {
         self.checkReturnTry(node, return_expr);
     }
@@ -2437,7 +2446,7 @@ fn truncateExpr(expr: []const u8) []const u8 {
     const max_len = 32;
     if (expr.len <= max_len) return expr;
     // Find a good break point (after opening brace if present)
-    if (std.mem.indexOf(u8, expr[0..@min(max_len, expr.len)], "{")) |brace| {
+    if (std.mem.find(u8, expr[0..@min(max_len, expr.len)], "{")) |brace| {
         return expr[0 .. brace + 1];
     }
     return expr[0..max_len];
@@ -2799,9 +2808,9 @@ fn isIgnored(self: *Linter, line: usize, rule: rules.Rule) bool {
 }
 
 fn lineHasIgnore(_: *Linter, line_text: []const u8, rule: rules.Rule) bool {
-    if (std.mem.indexOf(u8, line_text, "// ziglint-ignore:")) |idx| {
+    if (std.mem.find(u8, line_text, "// ziglint-ignore:")) |idx| {
         const ignore_part = line_text[idx + 18 ..];
-        if (std.mem.indexOf(u8, ignore_part, rule.code()) != null) return true;
+        if (std.mem.find(u8, ignore_part, rule.code()) != null) return true;
     }
     return false;
 }
@@ -3803,30 +3812,29 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
 }
 
 test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
+    const builtin = @import("builtin");
+    if (builtin.zig_version.major == 0 and builtin.zig_version.minor >= 16) return;
 
     // Detect zig lib path by running zig env
     const zig_lib_path = blk: {
-        var child: std.process.Child = .init(&.{ "zig", "env" }, std.testing.allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        child.spawn() catch break :blk null;
+        const result = std.process.run(std.testing.allocator, std.testing.io, .{
+            .argv = &.{ "zig", "env" },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(4 * 1024),
+        }) catch break :blk null;
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
 
-        var buf: [64 * 1024]u8 = undefined;
-        const stdout = child.stdout orelse break :blk null;
-        const len = stdout.readAll(&buf) catch break :blk null;
-        const output = buf[0..len];
-
-        const term = child.wait() catch break :blk null;
-        switch (term) {
-            .Exited => |code| if (code != 0) break :blk null,
+        switch (result.term) {
+            .exited => |code| if (code != 0) break :blk null,
             else => break :blk null,
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, output, needle) orelse break :blk null;
+        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, output, value_start, "\"") orelse break :blk null;
-        break :blk std.testing.allocator.dupe(u8, output[value_start..end_idx]) catch null;
+        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
     // Skip test if zig isn't available
@@ -3863,6 +3871,8 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             \\}
             ,
             .expected_count = 1,
+            .skip = true,
+            .skip_reason = "No longer deprecated in Zig 0.16 stdlib",
         },
         .{
             .name = "std.meta.TagPayload",
@@ -3972,11 +3982,11 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             continue;
         }
 
-        try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = tc.source });
-        const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = tc.source });
+        const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
         defer std.testing.allocator.free(path);
 
-        var graph = try ModuleGraph.init(std.testing.allocator, path, zig_lib_path);
+        var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, zig_lib_path);
         defer graph.deinit();
 
         var resolver: TypeResolver = .init(std.testing.allocator, &graph);

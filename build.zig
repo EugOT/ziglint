@@ -112,10 +112,10 @@ fn getVersion(b: *std.Build) []const u8 {
     const trimmed = std.mem.trim(u8, git_describe, " \n\r");
     const without_v = if (trimmed.len > 0 and trimmed[0] == 'v') trimmed[1..] else trimmed;
 
-    if (std.mem.indexOfScalar(u8, without_v, '-')) |dash_idx| {
+    if (std.mem.findScalar(u8, without_v, '-')) |dash_idx| {
         const tag_part = without_v[0..dash_idx];
         const rest = without_v[dash_idx + 1 ..];
-        if (std.mem.indexOfScalar(u8, rest, '-')) |second_dash| {
+        if (std.mem.findScalar(u8, rest, '-')) |second_dash| {
             const count = rest[0..second_dash];
             const hash = rest[second_dash + 1 ..];
             const hash_without_g = if (hash.len > 0 and hash[0] == 'g') hash[1..] else hash;

@@ -444,8 +444,14 @@ fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, mod
                                 self.allocator.free(resolved);
                                 continue;
                             };
+                            const canonical_copy = self.allocator.dupe(u8, canonical) catch {
+                                self.allocator.free(canonical);
+                                self.allocator.free(resolved);
+                                continue;
+                            };
+                            self.allocator.free(canonical);
                             self.allocator.free(resolved);
-                            return .{ .import_path = canonical };
+                            return .{ .import_path = canonical_copy };
                         }
                     }
                 }
