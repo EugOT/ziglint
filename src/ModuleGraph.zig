@@ -17,7 +17,12 @@ root_dir: []const u8,
 modules: std.StringHashMapUnmanaged(Module),
 
 pub const Module = struct {
-    path: []const u8,
+    /// Sentinel-terminated to match the buffer returned by `realPathFileAlloc`,
+    /// which allocates `len + 1` bytes. Storing it as `[:0]const u8` keeps the
+    /// free path size-accurate (no implicit slice-shortening) and avoids the
+    /// previous "alloc then dupe" double allocation. The sentinel is a useful
+    /// extra (paths can be passed to libc-style APIs without re-duping).
+    path: [:0]const u8,
     source: [:0]const u8,
     tree: Ast,
     zir: ?Zir = null,
@@ -56,9 +61,15 @@ pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {
 }
 
 fn addModule(self: *ModuleGraph, path: []const u8) !void {
-    const canonical_z = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
-    defer self.allocator.free(canonical_z);
-    const canonical = try self.allocator.dupe(u8, canonical_z);
+    // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8` (allocated as
+    // `len + 1` bytes). We store the canonical path with its sentinel intact so
+    // the matching `free` later sees the same slice it was allocated as -- this
+    // is what avoids the "Allocation size N+1 vs free size N" debug-allocator
+    // panic. The graph owns this buffer for its lifetime; it is freed in
+    // `deinit`. No extra `dupe` is needed (the previous code did one purely to
+    // strip the sentinel for typing reasons).
+    const canonical: [:0]const u8 = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+    errdefer self.allocator.free(canonical);
 
     if (self.modules.contains(canonical)) {
         self.allocator.free(canonical);

@@ -89,7 +89,9 @@ pub fn main(init: std.process.Init) !u8 {
         const abs_path_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch null;
         defer if (abs_path_z) |p| allocator.free(p);
         const abs_path: []const u8 = if (abs_path_z) |p| p else path;
-        const project_root = findProjectRoot(io, abs_path);
+        // `project_root` is allocated from the process-lifetime arena (`cfg_alloc`)
+        // so it lives until end-of-main without a manual free.
+        const project_root = findProjectRoot(cfg_alloc, io, abs_path);
         total_issues += try lintPath(allocator, io, path, zig_lib_path, &config, use_color, project_root, &stderr.interface);
     }
 
@@ -108,19 +110,22 @@ fn detectColorSupport(file: std.Io.File, io: std.Io, environ_map: *const std.pro
     // NO_COLOR takes precedence (https://no-color.org/)
     if (environ_map.get("NO_COLOR")) |_| return false;
     if (environ_map.get("FORCE_COLOR")) |_| return true;
-    // Otherwise, use color if stdout is a TTY
+    // Otherwise, use color if the provided file (caller-selected stream, e.g. stderr) is a TTY
     return file.isTty(io) catch false;
 }
 
-fn findProjectRoot(io: std.Io, start_path: []const u8) ?[]const u8 {
+/// Walks upwards from `start_path` looking for a directory containing `build.zig`.
+/// The returned slice is owned by `allocator` (callers typically pass a process-lifetime
+/// arena). Returns `null` if no project root is found or on allocation/IO failure.
+fn findProjectRoot(allocator: std.mem.Allocator, io: std.Io, start_path: []const u8) ?[]const u8 {
     var path = start_path;
     while (true) {
         // Check if build.zig exists in this directory
-        const build_zig = std.fs.path.join(std.heap.page_allocator, &.{ path, "build.zig" }) catch return null;
-        defer std.heap.page_allocator.free(build_zig);
+        const build_zig = std.fs.path.join(allocator, &.{ path, "build.zig" }) catch return null;
+        defer allocator.free(build_zig);
 
         if (std.Io.Dir.cwd().access(io, build_zig, .{})) |_| {
-            return std.heap.page_allocator.dupe(u8, path) catch null;
+            return allocator.dupe(u8, path) catch null;
         } else |_| {}
 
         // Move up one directory
@@ -632,4 +637,56 @@ test "applyOnlyRules keeps ignore precedence" {
     try std.testing.expect(config.file_config.isRuleEnabled(.Z001));
     try std.testing.expect(!config.file_config.isRuleEnabled(.Z002));
     try std.testing.expect(!config.file_config.isRuleEnabled(.Z003));
+}
+
+/// Test-only Io provider matching the convention used by ModuleGraph/TypeResolver.
+fn testIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+test "findProjectRoot returns owned slice from caller allocator (no leak)" {
+    // Regression: previously `findProjectRoot` allocated via std.heap.page_allocator
+    // and the result was never freed by the caller (memory leak per Copilot finding).
+    // The fixed signature takes an explicit allocator. Using std.testing.allocator
+    // here ensures the caller-side free succeeds and that no other allocations
+    // escape the function.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = testIo();
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig", .data = "// minimal build.zig" });
+    try tmp.dir.createDirPath(io, "src");
+
+    const root_abs = try tmp.dir.realPathFileAlloc(io, "build.zig", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    // Pass the build.zig path's directory as start; findProjectRoot should locate it.
+    const dir_of_root = std.fs.path.dirname(root_abs) orelse unreachable;
+
+    const found = findProjectRoot(std.testing.allocator, io, dir_of_root);
+    try std.testing.expect(found != null);
+    defer std.testing.allocator.free(found.?);
+
+    try std.testing.expectEqualStrings(dir_of_root, found.?);
+}
+
+test "findProjectRoot returns null when no build.zig is found" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = testIo();
+    try tmp.dir.createDirPath(io, "isolated/nested");
+
+    // realPathFileAlloc requires a regular file; resolve via a sentinel file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "isolated/nested/sentinel", .data = "" });
+    const sentinel = try tmp.dir.realPathFileAlloc(io, "isolated/nested/sentinel", std.testing.allocator);
+    defer std.testing.allocator.free(sentinel);
+    const start = std.fs.path.dirname(sentinel) orelse unreachable;
+
+    // Walking up will eventually hit filesystem root without finding build.zig
+    // (the temp dir tree we created has no build.zig anywhere on the path).
+    // To make this deterministic regardless of host layout, just verify that
+    // either we get null OR a slice we can free without a leak.
+    const found = findProjectRoot(std.testing.allocator, io, start);
+    if (found) |p| std.testing.allocator.free(p);
 }

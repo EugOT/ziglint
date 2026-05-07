@@ -446,6 +446,12 @@ fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, mod
                         if (std.mem.endsWith(u8, import_str, ".zig")) {
                             const module_dir = std.fs.path.dirname(module_path) orelse ".";
                             const resolved = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch continue;
+                            // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`
+                            // (allocated `len + 1`). We dupe into a plain `[]u8` so the
+                            // returned `DeclResult.import_path` type-matches the non-sentinel
+                            // sibling (`current_module_path`) used by callers, which uniformly
+                            // free the slice with the same length they received -- avoiding the
+                            // sentinel/non-sentinel size mismatch in DebugAllocator.
                             const canonical_z = std.Io.Dir.cwd().realPathFileAlloc(self.graph.io, resolved, self.allocator) catch {
                                 self.allocator.free(resolved);
                                 continue;
