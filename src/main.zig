@@ -20,23 +20,38 @@ pub const Config = struct {
     verbose: bool = false,
 };
 
-pub fn main() !u8 {
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+/// Compatibility shim for the removed std.time.Timer in Zig 0.16.
+/// Wraps std.Io.Timestamp + monotonic clock with a Timer-like read() interface.
+const VerboseTimer = struct {
+    start: std.Io.Timestamp,
 
-    const stderr_file = std.fs.File.stderr();
-    const use_color = detectColorSupport(stderr_file);
+    fn init(io: std.Io) VerboseTimer {
+        return .{ .start = std.Io.Timestamp.now(io, .awake) };
+    }
+
+    fn read(self: *VerboseTimer, io: std.Io) u64 {
+        const elapsed = self.start.durationTo(std.Io.Timestamp.now(io, .awake));
+        return @intCast(@max(elapsed.nanoseconds, 0));
+    }
+};
+
+pub fn main(init: std.process.Init) !u8 {
+    const allocator = init.gpa;
+    const io = init.io;
+    const environ_map = init.environ_map;
+
+    const stderr_file = std.Io.File.stderr();
+    const use_color = detectColorSupport(stderr_file, io, environ_map);
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
     defer stdout.end() catch {};
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr = stderr_file.writer(&stderr_buf);
+    var stderr = stderr_file.writer(io, &stderr_buf);
     defer stderr.end() catch {};
 
-    var config = parseArgs(allocator, &stderr.interface) catch |err| switch (err) {
+    var config = parseArgs(allocator, init.minimal.args, &stderr.interface) catch |err| switch (err) {
         error.HelpOrVersion => return 0,
         error.InvalidArgs => return 1,
         else => return err,
@@ -44,7 +59,7 @@ pub fn main() !u8 {
 
     // Load config file from first CLI path (or current directory)
     const start_path = if (config.paths.len > 0) config.paths[0] else null;
-    config.file_config = FileConfig.load(allocator, start_path) catch .{};
+    config.file_config = FileConfig.load(io, allocator, start_path) catch .{};
 
     applyOnlyRules(&config);
 
@@ -57,19 +72,21 @@ pub fn main() !u8 {
         }
     }
 
-    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, &stderr.interface) catch null;
+    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, io, &stderr.interface) catch null;
 
-    var total_timer = if (config.verbose) std.time.Timer.start() catch null else null;
+    var total_timer = if (config.verbose) VerboseTimer.init(io) else null;
 
     var total_issues: usize = 0;
     for (config.paths) |path| {
-        const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch path;
-        const project_root = findProjectRoot(abs_path);
-        total_issues += try lintPath(allocator, path, zig_lib_path, &config, use_color, project_root, &stderr.interface);
+        const abs_path_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch null;
+        defer if (abs_path_z) |p| allocator.free(p);
+        const abs_path: []const u8 = if (abs_path_z) |p| p else path;
+        const project_root = findProjectRoot(io, abs_path);
+        total_issues += try lintPath(allocator, io, path, zig_lib_path, &config, use_color, project_root, &stderr.interface);
     }
 
     if (config.verbose and total_timer != null) {
-        const total_ms = @as(f64, @floatFromInt(total_timer.?.read())) / 1_000_000.0;
+        const total_ms = @as(f64, @floatFromInt(total_timer.?.read(io))) / 1_000_000.0;
         const dim = if (use_color) "\x1b[2m" else "";
         const cyan = if (use_color) "\x1b[36m" else "";
         const reset = if (use_color) "\x1b[0m" else "";
@@ -79,28 +96,22 @@ pub fn main() !u8 {
     return if (total_issues > 0) 1 else 0;
 }
 
-fn detectColorSupport(file: std.fs.File) bool {
-    const native = builtin.os.tag;
+fn detectColorSupport(file: std.Io.File, io: std.Io, environ_map: *const std.process.Environ.Map) bool {
     // NO_COLOR takes precedence (https://no-color.org/)
-    if (native == .windows) {
-        if (std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("NO_COLOR"))) |_| return false;
-        if (std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("FORCE_COLOR"))) |_| return true;
-    } else {
-        if (std.posix.getenv("NO_COLOR")) |_| return false;
-        if (std.posix.getenv("FORCE_COLOR")) |_| return true;
-    }
+    if (environ_map.get("NO_COLOR")) |_| return false;
+    if (environ_map.get("FORCE_COLOR")) |_| return true;
     // Otherwise, use color if stdout is a TTY
-    return file.isTty();
+    return file.isTty(io) catch false;
 }
 
-fn findProjectRoot(start_path: []const u8) ?[]const u8 {
+fn findProjectRoot(io: std.Io, start_path: []const u8) ?[]const u8 {
     var path = start_path;
     while (true) {
         // Check if build.zig exists in this directory
         const build_zig = std.fs.path.join(std.heap.page_allocator, &.{ path, "build.zig" }) catch return null;
         defer std.heap.page_allocator.free(build_zig);
 
-        if (std.fs.cwd().access(build_zig, .{})) |_| {
+        if (std.Io.Dir.cwd().access(io, build_zig, .{})) |_| {
             return std.heap.page_allocator.dupe(u8, path) catch null;
         } else |_| {}
 
@@ -124,46 +135,45 @@ fn makeRelativePath(path: []const u8, project_root: ?[]const u8) []const u8 {
     return path;
 }
 
-fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
-    const args = try std.process.argsAlloc(allocator);
+fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args, writer: *std.Io.Writer) !Config {
+    var iter = try args.iterateAllocator(allocator);
+    defer iter.deinit();
 
     var config: Config = .{};
     var paths: std.ArrayList([]const u8) = .empty;
     var only_rules: std.ArrayList(rules.Rule) = .empty;
     var ignored_rules: std.ArrayList(rules.Rule) = .empty;
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    // Skip program name (argv[0])
+    _ = iter.skip();
+
+    while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--zig-lib-path")) {
-            i += 1;
-            if (i >= args.len) {
+            const next = iter.next() orelse {
                 try writer.writeAll("error: --zig-lib-path requires a path argument\n");
                 return error.InvalidArgs;
-            }
-            config.zig_lib_path = args[i];
+            };
+            config.zig_lib_path = try allocator.dupe(u8, next);
         } else if (std.mem.eql(u8, arg, "--only")) {
-            i += 1;
-            if (i >= args.len) {
+            const next = iter.next() orelse {
                 try writer.writeAll("error: --only requires a rule code (e.g., Z001)\n");
                 return error.InvalidArgs;
-            }
-            if (parseRuleCode(args[i])) |rule| {
+            };
+            if (parseRuleCode(next)) |rule| {
                 try only_rules.append(allocator, rule);
             } else {
-                try writer.print("error: unknown rule code '{s}'\n", .{args[i]});
+                try writer.print("error: unknown rule code '{s}'\n", .{next});
                 return error.InvalidArgs;
             }
         } else if (std.mem.eql(u8, arg, "--ignore")) {
-            i += 1;
-            if (i >= args.len) {
+            const next = iter.next() orelse {
                 try writer.writeAll("error: --ignore requires a rule code (e.g., Z001)\n");
                 return error.InvalidArgs;
-            }
-            if (parseRuleCode(args[i])) |rule| {
+            };
+            if (parseRuleCode(next)) |rule| {
                 try ignored_rules.append(allocator, rule);
             } else {
-                try writer.print("error: unknown rule code '{s}'\n", .{args[i]});
+                try writer.print("error: unknown rule code '{s}'\n", .{next});
                 return error.InvalidArgs;
             }
         } else if (std.mem.eql(u8, arg, "--verbose")) {
@@ -178,7 +188,7 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
             try writer.print("error: unknown option '{s}'\n", .{arg});
             return error.InvalidArgs;
         } else {
-            try paths.append(allocator, arg);
+            try paths.append(allocator, try allocator.dupe(u8, arg));
         }
     }
 
@@ -215,28 +225,23 @@ fn applyOnlyRules(config: *Config) void {
     }
 }
 
-fn detectZigLibPath(allocator: std.mem.Allocator, writer: *std.Io.Writer) !?[]const u8 {
-    var child: std.process.Child = .init(&.{ "zig", "env" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch |err| {
+fn detectZigLibPath(allocator: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer) !?[]const u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "zig", "env" },
+        .stdout_limit = .limited(64 * 1024),
+    }) catch |err| {
         try writer.print("warning: could not run 'zig env': {}\n", .{err});
         return null;
     };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
-    var buf: [64 * 1024]u8 = undefined;
-    const stdout = child.stdout orelse return null;
-    const len = stdout.readAll(&buf) catch return null;
-    const output = buf[0..len];
-
-    const term = child.wait() catch return null;
-    switch (term) {
-        .Exited => |code| if (code != 0) return null,
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
-    return parseLibDirFromZigEnv(allocator, output);
+    return parseLibDirFromZigEnv(allocator, result.stdout);
 }
 
 fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]const u8 {
@@ -247,30 +252,30 @@ fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]co
     return allocator.dupe(u8, output[value_start..end_idx]) catch null;
 }
 
-fn lintPath(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
-    const stat = std.fs.cwd().statFile(path) catch |err| {
+fn lintPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
         if (err == error.IsDir) {
-            return lintDirectory(allocator, path, zig_lib_path, config, use_color, project_root, writer);
+            return lintDirectory(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
         }
         try writer.print("error: cannot access '{s}': {}\n", .{ path, err });
         return 0;
     };
 
     if (stat.kind == .directory) {
-        return lintDirectory(allocator, path, zig_lib_path, config, use_color, project_root, writer);
+        return lintDirectory(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
     }
 
-    return lintFile(allocator, path, zig_lib_path, config, use_color, project_root, writer);
+    return lintFile(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
 }
 
-fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         try writer.print("error: cannot open directory '{s}': {}\n", .{ path, err });
         return 0;
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    const gitignore = loadGitignore(allocator, dir);
+    const gitignore = loadGitignore(io, allocator, dir);
     defer if (gitignore) |g| allocator.free(g);
 
     // Collect all .zig files first
@@ -286,7 +291,7 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
     };
     defer walker.deinit();
 
-    while (walker.next() catch null) |entry| {
+    while (walker.next(io) catch null) |entry| {
         if (shouldSkip(entry.path, gitignore)) continue;
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
@@ -308,55 +313,55 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
         try writer.print("{s}┌─ {s}{s}{s} ({d} files)\n", .{ dim, reset, path, reset, files.items.len });
     }
 
-    var timer = if (config.verbose) std.time.Timer.start() catch null else null;
+    var timer = if (config.verbose) VerboseTimer.init(io) else null;
 
     // Build module graph once using first file as root, then add all others
-    const graph_start = if (timer) |*t| t.read() else 0;
-    var graph = ModuleGraph.init(allocator, files.items[0], zig_lib_path) catch {
+    const graph_start = if (timer) |*t| t.read(io) else 0;
+    var graph = ModuleGraph.init(io, allocator, files.items[0], zig_lib_path) catch {
         // Fall back to per-file linting without semantics
         if (config.verbose) {
             try writer.print("{s}│ module graph failed, using simple linting{s}\n", .{ dim, reset });
         }
         var total: usize = 0;
         for (files.items) |file_path| {
-            total += try lintFileSimple(allocator, file_path, config, use_color, project_root, writer);
+            total += try lintFileSimple(allocator, io, file_path, config, use_color, project_root, writer);
         }
         return total;
     };
     defer graph.deinit();
 
     if (config.verbose and timer != null) {
-        const elapsed = timer.?.read() - graph_start;
+        const elapsed = timer.?.read(io) - graph_start;
         try writer.print("{s}│ module graph:  {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
     // Add remaining files to the graph
-    const add_start = if (timer) |*t| t.read() else 0;
+    const add_start = if (timer) |*t| t.read(io) else 0;
     for (files.items[1..]) |file_path| {
         graph.addModulePublic(file_path);
     }
 
     if (config.verbose and timer != null and files.items.len > 1) {
-        const elapsed = timer.?.read() - add_start;
+        const elapsed = timer.?.read(io) - add_start;
         try writer.print("{s}│ add files:     {s}{d:>7.2}ms{s} ({d} files)\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset, files.items.len - 1 });
     }
 
-    const resolver_start = if (timer) |*t| t.read() else 0;
+    const resolver_start = if (timer) |*t| t.read(io) else 0;
     var resolver: TypeResolver = .init(allocator, &graph);
     defer resolver.deinit();
 
     if (config.verbose and timer != null) {
-        const elapsed = timer.?.read() - resolver_start;
+        const elapsed = timer.?.read(io) - resolver_start;
         try writer.print("{s}│ type resolver: {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
     var total: usize = 0;
     for (files.items) |file_path| {
-        total += try lintFileWithGraph(allocator, file_path, &graph, &resolver, config, use_color, project_root, writer);
+        total += try lintFileWithGraph(allocator, io, file_path, &graph, &resolver, config, use_color, project_root, writer);
     }
 
     if (config.verbose and timer != null) {
-        const total_time = timer.?.read();
+        const total_time = timer.?.read(io);
         try writer.print("{s}└─ total:        {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(total_time)) / 1_000_000.0, reset });
     }
 
@@ -401,12 +406,12 @@ fn matchesGitignore(path: []const u8, pattern: []const u8) bool {
     return std.mem.indexOf(u8, path, clean_pattern) != null;
 }
 
-fn loadGitignore(allocator: std.mem.Allocator, dir: std.fs.Dir) ?[]const u8 {
-    return dir.readFileAlloc(allocator, ".gitignore", 1024 * 64) catch null;
+fn loadGitignore(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?[]const u8 {
+    return dir.readFileAlloc(io, ".gitignore", allocator, .limited(1024 * 64)) catch null;
 }
 
-fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
-    var timer = if (config.verbose) std.time.Timer.start() catch null else null;
+fn lintFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    var timer = if (config.verbose) VerboseTimer.init(io) else null;
 
     const dim = if (use_color) "\x1b[2m" else "";
     const cyan = if (use_color) "\x1b[36m" else "";
@@ -416,42 +421,42 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]con
         try writer.print("{s}┌─ {s}{s}{s}\n", .{ dim, reset, path, reset });
     }
 
-    const graph_start = if (timer) |*t| t.read() else 0;
-    var graph = ModuleGraph.init(allocator, path, zig_lib_path) catch {
-        return lintFileSimple(allocator, path, config, use_color, project_root, writer);
+    const graph_start = if (timer) |*t| t.read(io) else 0;
+    var graph = ModuleGraph.init(io, allocator, path, zig_lib_path) catch {
+        return lintFileSimple(allocator, io, path, config, use_color, project_root, writer);
     };
     defer graph.deinit();
 
     if (config.verbose and timer != null) {
-        const elapsed = timer.?.read() - graph_start;
+        const elapsed = timer.?.read(io) - graph_start;
         try writer.print("{s}│ module graph:  {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
-    const resolver_start = if (timer) |*t| t.read() else 0;
+    const resolver_start = if (timer) |*t| t.read(io) else 0;
     var resolver: TypeResolver = .init(allocator, &graph);
     defer resolver.deinit();
 
     if (config.verbose and timer != null) {
-        const elapsed = timer.?.read() - resolver_start;
+        const elapsed = timer.?.read(io) - resolver_start;
         try writer.print("{s}│ type resolver: {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
-    const result = try lintFileWithGraph(allocator, path, &graph, &resolver, config, use_color, project_root, writer);
+    const result = try lintFileWithGraph(allocator, io, path, &graph, &resolver, config, use_color, project_root, writer);
 
     if (config.verbose and timer != null) {
-        const total = timer.?.read();
+        const total = timer.?.read(io);
         try writer.print("{s}└─ total:        {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(total)) / 1_000_000.0, reset });
     }
 
     return result;
 }
 
-fn lintFileSimple(allocator: std.mem.Allocator, path: []const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
-    const source = std.fs.cwd().readFileAllocOptions(
-        allocator,
+fn lintFileSimple(allocator: std.mem.Allocator, io: std.Io, path: []const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        io,
         path,
-        1024 * 1024 * 16,
-        null,
+        allocator,
+        .limited(1024 * 1024 * 16),
         .@"1",
         0,
     ) catch |err| {
@@ -463,12 +468,12 @@ fn lintFileSimple(allocator: std.mem.Allocator, path: []const u8, config: *const
     var linter: Linter = .init(allocator, source, path, &config.file_config);
     defer linter.deinit();
     linter.lint();
-    return writeDiagnostics(linter.diagnostics.items, config, use_color, project_root, writer);
+    return writeDiagnostics(allocator, linter.diagnostics.items, config, use_color, project_root, writer);
 }
 
-fn lintFileWithGraph(allocator: std.mem.Allocator, path: []const u8, graph: *ModuleGraph, resolver: *TypeResolver, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+fn lintFileWithGraph(allocator: std.mem.Allocator, io: std.Io, path: []const u8, graph: *ModuleGraph, resolver: *TypeResolver, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     const mod = graph.getModule(path) orelse {
-        return lintFileSimple(allocator, path, config, use_color, project_root, writer);
+        return lintFileSimple(allocator, io, path, config, use_color, project_root, writer);
     };
 
     const dim = if (use_color) "\x1b[2m" else "";
@@ -481,26 +486,26 @@ fn lintFileWithGraph(allocator: std.mem.Allocator, path: []const u8, graph: *Mod
     linter.verbose = config.verbose;
     linter.use_color = use_color;
 
-    var timer = if (config.verbose) std.time.Timer.start() catch null else null;
+    var timer = if (config.verbose) VerboseTimer.init(io) else null;
     linter.lint();
 
     if (config.verbose and timer != null) {
-        const elapsed = timer.?.read();
+        const elapsed = timer.?.read(io);
         try writer.print("{s}│ linting:       {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
-    return writeDiagnostics(linter.diagnostics.items, config, use_color, project_root, writer);
+    return writeDiagnostics(allocator, linter.diagnostics.items, config, use_color, project_root, writer);
 }
 
-fn writeDiagnostics(diagnostics: []const Linter.Diagnostic, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+fn writeDiagnostics(allocator: std.mem.Allocator, diagnostics: []const Linter.Diagnostic, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     var count: usize = 0;
-    var rule_counts = std.AutoHashMap(rules.Rule, usize).init(std.heap.page_allocator);
-    defer rule_counts.deinit();
+    var rule_counts: std.AutoHashMapUnmanaged(rules.Rule, usize) = .empty;
+    defer rule_counts.deinit(allocator);
 
     for (diagnostics) |diag| {
         // Track rule counts for verbose output
         if (config.verbose) {
-            const entry = rule_counts.getOrPut(diag.rule) catch continue;
+            const entry = rule_counts.getOrPut(allocator, diag.rule) catch continue;
             if (!entry.found_existing) {
                 entry.value_ptr.* = 0;
             }

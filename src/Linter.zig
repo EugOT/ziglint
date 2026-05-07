@@ -22,6 +22,20 @@ pub const DeprecationKey = struct {
 
 const Linter = @This();
 
+/// Stub Timer for Zig 0.16 compatibility.
+/// Timer was removed in 0.16; the proper replacement requires threading
+/// std.Io through Linter, which would touch 200+ test call sites. Verbose timing
+/// in Linter is diagnostic-only (perf debug), so we degrade reads to 0 here and
+/// leave the wider Io plumbing for a follow-up refactor.
+const Timer = struct {
+    pub fn start() error{}!Timer {
+        return .{};
+    }
+    pub fn read(_: *Timer) u64 {
+        return 0;
+    }
+};
+
 allocator: std.mem.Allocator,
 source: [:0]const u8,
 path: []const u8,
@@ -44,7 +58,7 @@ verbose: bool = false,
 use_color: bool = false,
 /// Track time spent checking each rule type (nanoseconds)
 rule_timings: std.AutoHashMapUnmanaged(rules.Rule, u64) = .empty,
-rule_timer: ?std.time.Timer = null,
+rule_timer: ?Timer = null,
 
 const default_config: Config = .{};
 
@@ -151,9 +165,9 @@ pub fn deinit(self: *Linter) void {
 }
 
 pub fn lint(self: *Linter) void {
-    var timer = if (self.verbose) std.time.Timer.start() catch null else null;
+    var timer = if (self.verbose) Timer.start() catch null else null;
     if (self.verbose) {
-        self.rule_timer = std.time.Timer.start() catch null;
+        self.rule_timer = Timer.start() catch null;
     }
 
     const dim = if (self.use_color) "\x1b[2m" else "";

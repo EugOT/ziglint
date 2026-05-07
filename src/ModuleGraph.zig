@@ -11,6 +11,7 @@ const AstGen = std.zig.AstGen;
 const ModuleGraph = @This();
 
 allocator: std.mem.Allocator,
+io: std.Io,
 zig_lib_path: ?[]const u8,
 root_dir: []const u8,
 modules: std.StringHashMapUnmanaged(Module),
@@ -22,11 +23,12 @@ pub const Module = struct {
     zir: ?Zir = null,
 };
 
-pub fn init(allocator: std.mem.Allocator, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
+pub fn init(io: std.Io, allocator: std.mem.Allocator, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
     const root_dir = std.fs.path.dirname(root_source) orelse ".";
 
     var graph: ModuleGraph = .{
         .allocator = allocator,
+        .io = io,
         .zig_lib_path = zig_lib_path,
         .root_dir = root_dir,
         .modules = .empty,
@@ -54,18 +56,20 @@ pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {
 }
 
 fn addModule(self: *ModuleGraph, path: []const u8) !void {
-    const canonical = try std.fs.cwd().realpathAlloc(self.allocator, path);
+    const canonical_z = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+    defer self.allocator.free(canonical_z);
+    const canonical = try self.allocator.dupe(u8, canonical_z);
 
     if (self.modules.contains(canonical)) {
         self.allocator.free(canonical);
         return;
     }
 
-    const source = std.fs.cwd().readFileAllocOptions(
-        self.allocator,
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        self.io,
         canonical,
-        1024 * 1024 * 16,
-        null,
+        self.allocator,
+        .limited(1024 * 1024 * 16),
         .@"1",
         0,
     ) catch |err| {
@@ -234,7 +238,7 @@ pub fn moduleCount(self: *const ModuleGraph) usize {
 }
 
 pub fn getModule(self: *const ModuleGraph, path: []const u8) ?*const Module {
-    const canonical = std.fs.cwd().realpathAlloc(self.allocator, path) catch return null;
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator) catch return null;
     defer self.allocator.free(canonical);
     return self.modules.getPtr(canonical);
 }
@@ -304,7 +308,7 @@ test "no duplicate modules" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data =
         \\const a = @import("shared.zig");
         \\const b = @import("other.zig");
     });

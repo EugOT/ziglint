@@ -440,11 +440,16 @@ fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, mod
                         if (std.mem.endsWith(u8, import_str, ".zig")) {
                             const module_dir = std.fs.path.dirname(module_path) orelse ".";
                             const resolved = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch continue;
-                            const canonical = std.fs.cwd().realpathAlloc(self.allocator, resolved) catch {
+                            const canonical_z = std.Io.Dir.cwd().realPathFileAlloc(self.graph.io, resolved, self.allocator) catch {
                                 self.allocator.free(resolved);
                                 continue;
                             };
                             self.allocator.free(resolved);
+                            const canonical = self.allocator.dupe(u8, canonical_z) catch {
+                                self.allocator.free(canonical_z);
+                                continue;
+                            };
+                            self.allocator.free(canonical_z);
                             return .{ .import_path = canonical };
                         }
                     }
