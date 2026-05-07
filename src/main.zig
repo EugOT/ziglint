@@ -40,6 +40,14 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const environ_map = init.environ_map;
 
+    // Process-lifetime arena for CLI paths, detected `zig env` lib dir, and
+    // FileConfig dupes. These all live until end-of-main, so an arena is the
+    // simplest leak-free pattern (avoids hand-tracking individual frees in
+    // the catch/return paths).
+    var config_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer config_arena.deinit();
+    const cfg_alloc = config_arena.allocator();
+
     const stderr_file = std.Io.File.stderr();
     const use_color = detectColorSupport(stderr_file, io, environ_map);
 
@@ -51,7 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
     var stderr = stderr_file.writer(io, &stderr_buf);
     defer stderr.end() catch {};
 
-    var config = parseArgs(allocator, init.minimal.args, &stderr.interface) catch |err| switch (err) {
+    var config = parseArgs(cfg_alloc, init.minimal.args, &stderr.interface) catch |err| switch (err) {
         error.HelpOrVersion => return 0,
         error.InvalidArgs => return 1,
         else => return err,
@@ -59,7 +67,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Load config file from first CLI path (or current directory)
     const start_path = if (config.paths.len > 0) config.paths[0] else null;
-    config.file_config = FileConfig.load(io, allocator, start_path) catch .{};
+    config.file_config = FileConfig.load(io, cfg_alloc, start_path) catch .{};
 
     applyOnlyRules(&config);
 
@@ -72,7 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, io, &stderr.interface) catch null;
+    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(cfg_alloc, allocator, io, &stderr.interface) catch null;
 
     var total_timer = if (config.verbose) VerboseTimer.init(io) else null;
 
@@ -225,23 +233,25 @@ fn applyOnlyRules(config: *Config) void {
     }
 }
 
-fn detectZigLibPath(allocator: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer) !?[]const u8 {
-    const result = std.process.run(allocator, io, .{
+/// `out_alloc` owns the returned slice (process-lifetime arena);
+/// `tmp_alloc` owns the temporary `zig env` stdout/stderr buffers.
+fn detectZigLibPath(out_alloc: std.mem.Allocator, tmp_alloc: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer) !?[]const u8 {
+    const result = std.process.run(tmp_alloc, io, .{
         .argv = &.{ "zig", "env" },
         .stdout_limit = .limited(64 * 1024),
     }) catch |err| {
         try writer.print("warning: could not run 'zig env': {}\n", .{err});
         return null;
     };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    defer tmp_alloc.free(result.stdout);
+    defer tmp_alloc.free(result.stderr);
 
     switch (result.term) {
         .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
-    return parseLibDirFromZigEnv(allocator, result.stdout);
+    return parseLibDirFromZigEnv(out_alloc, result.stdout);
 }
 
 fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]const u8 {

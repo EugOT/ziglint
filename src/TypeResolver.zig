@@ -479,7 +479,10 @@ fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: [
 
     const type_node = self.findTypeDecl(tree, type_name) orelse return null;
 
-    return self.findMethodInType(tree, type_node, method_name, module_path);
+    // Use `mod.path` (owned by the graph for the lifetime of the resolver)
+    // rather than the input `module_path`, which may be a temporary slice
+    // freed by callers like `findMethodInStdlib` after they return.
+    return self.findMethodInType(tree, type_node, method_name, mod.path);
 }
 
 /// For file-as-struct modules (like fs/File.zig), look for methods in root declarations.
