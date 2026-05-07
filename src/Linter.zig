@@ -22,6 +22,26 @@ pub const DeprecationKey = struct {
 
 const Linter = @This();
 
+/// Stub Timer for Zig 0.16 compatibility.
+/// Timer was removed in 0.16; the proper replacement requires threading
+/// std.Io through Linter, which would touch 200+ test call sites. Verbose timing
+/// in Linter is diagnostic-only (perf debug), so we degrade reads to 0 here and
+/// leave the wider Io plumbing for a follow-up refactor.
+const Timer = struct {
+    pub fn start() error{}!Timer {
+        return .{};
+    }
+    pub fn read(_: *Timer) u64 {
+        return 0;
+    }
+};
+
+/// Test-only Io provider. Tests are synchronous and don't need cancelation,
+/// so we use the global single-threaded Io instance.
+fn testIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 allocator: std.mem.Allocator,
 source: [:0]const u8,
 path: []const u8,
@@ -44,7 +64,7 @@ verbose: bool = false,
 use_color: bool = false,
 /// Track time spent checking each rule type (nanoseconds)
 rule_timings: std.AutoHashMapUnmanaged(rules.Rule, u64) = .empty,
-rule_timer: ?std.time.Timer = null,
+rule_timer: ?Timer = null,
 
 const default_config: Config = .{};
 
@@ -151,9 +171,9 @@ pub fn deinit(self: *Linter) void {
 }
 
 pub fn lint(self: *Linter) void {
-    var timer = if (self.verbose) std.time.Timer.start() catch null else null;
+    var timer = if (self.verbose) Timer.start() catch null else null;
     if (self.verbose) {
-        self.rule_timer = std.time.Timer.start() catch null;
+        self.rule_timer = Timer.start() catch null;
     }
 
     const dim = if (self.use_color) "\x1b[2m" else "";
@@ -3501,11 +3521,12 @@ test "Z011: detect deprecated method call" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3544,11 +3565,12 @@ test "Z011: no warning for non-deprecated method" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3597,11 +3619,12 @@ test "Z011: detect deprecated direct function call" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3635,11 +3658,12 @@ test "Z011: detect deprecated function alias" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3674,11 +3698,12 @@ test "Z011: detect deprecated type function" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3714,11 +3739,12 @@ test "Z011: detect deprecated type function alias" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3742,28 +3768,25 @@ test "Z011: detect deprecated type function alias" {
 test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
 
     // Detect zig lib path by running zig env
+    const io = testIo();
     const zig_lib_path = blk: {
-        var child: std.process.Child = .init(&.{ "zig", "env" }, std.testing.allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        child.spawn() catch break :blk null;
+        const result = std.process.run(std.testing.allocator, io, .{
+            .argv = &.{ "zig", "env" },
+            .stderr_limit = .nothing,
+        }) catch break :blk null;
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
 
-        var buf: [64 * 1024]u8 = undefined;
-        const stdout = child.stdout orelse break :blk null;
-        const len = stdout.readAll(&buf) catch break :blk null;
-        const output = buf[0..len];
-
-        const term = child.wait() catch break :blk null;
-        switch (term) {
-            .Exited => |code| if (code != 0) break :blk null,
+        switch (result.term) {
+            .exited => |code| if (code != 0) break :blk null,
             else => break :blk null,
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, output, needle) orelse break :blk null;
+        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, output, value_start, "\"") orelse break :blk null;
-        break :blk std.testing.allocator.dupe(u8, output[value_start..end_idx]) catch null;
+        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
     // Skip test if zig isn't available
@@ -3780,11 +3803,11 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, zig_lib_path);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, zig_lib_path);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3808,28 +3831,25 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
 test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
 
     // Detect zig lib path by running zig env
+    const io = testIo();
     const zig_lib_path = blk: {
-        var child: std.process.Child = .init(&.{ "zig", "env" }, std.testing.allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        child.spawn() catch break :blk null;
+        const result = std.process.run(std.testing.allocator, io, .{
+            .argv = &.{ "zig", "env" },
+            .stderr_limit = .nothing,
+        }) catch break :blk null;
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
 
-        var buf: [64 * 1024]u8 = undefined;
-        const stdout = child.stdout orelse break :blk null;
-        const len = stdout.readAll(&buf) catch break :blk null;
-        const output = buf[0..len];
-
-        const term = child.wait() catch break :blk null;
-        switch (term) {
-            .Exited => |code| if (code != 0) break :blk null,
+        switch (result.term) {
+            .exited => |code| if (code != 0) break :blk null,
             else => break :blk null,
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, output, needle) orelse break :blk null;
+        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, output, value_start, "\"") orelse break :blk null;
-        break :blk std.testing.allocator.dupe(u8, output[value_start..end_idx]) catch null;
+        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
     // Skip test if zig isn't available
@@ -3975,11 +3995,11 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             continue;
         }
 
-        try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = tc.source });
-        const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+        try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = tc.source });
+        const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
         defer std.testing.allocator.free(path);
 
-        var graph = try ModuleGraph.init(std.testing.allocator, path, zig_lib_path);
+        var graph = try ModuleGraph.init(io, std.testing.allocator, path, zig_lib_path);
         defer graph.deinit();
 
         var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4658,11 +4678,12 @@ test "Z023: argument order - aliased Allocator" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4691,11 +4712,12 @@ test "Z023: argument order - aliased Io" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4758,11 +4780,12 @@ test "Z023: receiver param with struct name is ok (semantic)" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4789,11 +4812,12 @@ test "Z023: file-as-struct receiver is ok (semantic)" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "Terminal.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "Terminal.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "Terminal.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "Terminal.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5159,11 +5183,12 @@ test "Z027: flag instance accessing const" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5199,11 +5224,12 @@ test "Z027: flag instance accessing static fn" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5241,11 +5267,12 @@ test "Z027: allow instance method call" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5277,11 +5304,12 @@ test "Z027: allow field access" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5313,11 +5341,12 @@ test "Z027: allow type-level access" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5372,11 +5401,12 @@ test "Z027: allow method with Self receiver" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5411,11 +5441,12 @@ test "Z027: allow method with named type receiver" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5502,11 +5533,12 @@ test "Z029: detect redundant @as in method call arg" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
