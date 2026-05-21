@@ -28,9 +28,8 @@
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            zig_0_15
-            zls_0_15
-            zlint
+            zig_0_16
+            zls_0_16
             zigdoc
           ];
 
