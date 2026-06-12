@@ -1096,6 +1096,9 @@ fn isBuiltinTypeConstructor(name: []const u8) bool {
         "@ErrorUnion",
         "@ErrorSet",
         "@Enum",
+        // @EnumLiteral() type and @Tuple(comptime field_types: []const type) type
+        // are documented Zig 0.16 type-constructor builtins (langref §@EnumLiteral,
+        // §@Tuple). They return `type`, so they belong in this list.
         "@EnumLiteral",
         "@Union",
         "@Struct",
