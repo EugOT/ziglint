@@ -197,9 +197,14 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
 
         for (doc.tests) |doc_test| {
             // Run every fixture before failing so one gate run reports all
-            // offending docs instead of stopping at the first.
-            runDocTest(allocator, full_path, doc_test, &tmp_dir) catch {
-                failure_count += 1;
+            // offending docs instead of stopping at the first. Only the two
+            // assertion errors count as fixture failures; infrastructure
+            // errors (I/O, OOM, ...) propagate immediately.
+            runDocTest(allocator, full_path, doc_test, &tmp_dir) catch |err| switch (err) {
+                error.MissingExpectedDiagnostic,
+                error.UnexpectedDiagnostic,
+                => failure_count += 1,
+                else => return err,
             };
             test_count += 1;
         }
