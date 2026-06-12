@@ -138,19 +138,21 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
         }
     }
 
-    // If no expectations, should have no diagnostics
-    if (doc_test.expected_rules.len == 0) {
-        const total = linter.diagnostics.items.len;
-        if (total > 0) {
-            std.debug.print("\n{s}:{d}: expected no diagnostics but got {d}\n", .{
+    // Reject diagnostics for rules that were not expected. Extra findings
+    // must not ride along silently just because one expectation matched —
+    // and with no expectations at all, any diagnostic is unexpected.
+    for (linter.diagnostics.items) |d| {
+        const expected = for (doc_test.expected_rules) |expected_rule| {
+            if (expected_rule == d.rule) break true;
+        } else false;
+        if (!expected) {
+            std.debug.print("\n{s}:{d}: unexpected {s} diagnostic: {s}\n", .{
                 doc_path,
                 doc_test.line_in_doc,
-                total,
+                d.rule.code(),
+                d.context,
             });
             std.debug.print("Code:\n{s}\n", .{doc_test.code});
-            for (linter.diagnostics.items) |d| {
-                std.debug.print("  - {s}: {s}\n", .{ d.rule.code(), d.context });
-            }
             return error.UnexpectedDiagnostic;
         }
     }
@@ -175,6 +177,7 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
 
     var file_count: usize = 0;
     var test_count: usize = 0;
+    var failure_count: usize = 0;
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
@@ -193,10 +196,24 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
         defer allocator.free(full_path);
 
         for (doc.tests) |doc_test| {
-            try runDocTest(allocator, full_path, doc_test, &tmp_dir);
+            // Run every fixture before failing so one gate run reports all
+            // offending docs instead of stopping at the first. Only the two
+            // assertion errors count as fixture failures; infrastructure
+            // errors (I/O, OOM, ...) propagate immediately.
+            runDocTest(allocator, full_path, doc_test, &tmp_dir) catch |err| switch (err) {
+                error.MissingExpectedDiagnostic,
+                error.UnexpectedDiagnostic,
+                => failure_count += 1,
+                else => return err,
+            };
             test_count += 1;
         }
         file_count += 1;
+    }
+
+    if (failure_count > 0) {
+        std.debug.print("\n{d}/{d} doc tests failed\n", .{ failure_count, test_count });
+        return error.DocTestsFailed;
     }
 }
 

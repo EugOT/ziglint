@@ -3,7 +3,9 @@
 
 const std = @import("std");
 
-const Rule = @import("rules.zig").Rule;
+/// Public re-export: `isRuleEnabled`/`setRuleEnabled` take a `Rule`, so the
+/// type must be reachable from this namespace by callers (ziglint Z012).
+pub const Rule = @import("rules.zig").Rule;
 
 const Config = @This();
 
@@ -26,6 +28,15 @@ pub fn isRuleEnabled(self: *const Config, rule: Rule) bool {
         }
     }
     return true;
+}
+
+/// Frees the `paths` entries allocated by `parseConfigSource` and leaves
+/// the config invalidated. Safe to call on a default-initialized `Config`
+/// (the default `paths` slice is empty and never freed).
+pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+    for (self.paths) |p| allocator.free(p);
+    if (self.paths.len > 0) allocator.free(self.paths);
+    self.* = undefined;
 }
 
 /// Set whether a rule is enabled.
@@ -194,11 +205,8 @@ test "parse paths config" {
         \\    },
         \\}
     ;
-    const config = try parseConfigSource(std.testing.allocator, source);
-    defer {
-        for (config.paths) |item| std.testing.allocator.free(item);
-        std.testing.allocator.free(config.paths);
-    }
+    var config = try parseConfigSource(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(2, config.paths.len);
     try std.testing.expectEqualStrings("src", config.paths[0]);
     try std.testing.expectEqualStrings("lib", config.paths[1]);
