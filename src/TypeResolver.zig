@@ -493,7 +493,7 @@ fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: [
 
 /// Alias chains (`const a = b;`) are followed at most this many hops so
 /// cyclic aliases (`const a = b; const b = a;`) cannot recurse unbounded.
-const max_alias_depth = 32;
+const max_alias_depth: u32 = 32;
 
 /// For file-as-struct modules (like fs/File.zig), look for methods in root declarations.
 fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method_name: []const u8) ?MethodDef {
