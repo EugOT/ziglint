@@ -47,27 +47,17 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
 
-    // Self-lint: the public `addLint` API enforces exit code 0 (so downstream
-    // users can fail their CI on findings). For our own `zig build test`
-    // aggregate we want to ensure ziglint doesn't *crash* on its own source,
-    // but we tolerate the residual lint findings (mostly stylistic) that
-    // remain after the Zig 0.16 migration.
     const lint_step = addLint(b, exe, &.{ b.path("src"), b.path("build.zig") });
     const lint_alias = b.step("lint", "Run ziglint on this repository");
     lint_alias.dependOn(lint_step);
 
-    // A separate "self-lint smoke" run gated into `zig build test`.
-    // Ziglint currently reports residual style findings (Z011/Z012/Z013/Z023)
-    // against its own Zig 0.16-migrated source. Until those are addressed we
-    // expect exit code 1 (findings reported), which still proves ziglint did
-    // not crash (segfault/ABRT). When the codebase becomes lint-clean this
-    // will start failing -- swap to `expectExitCode(0)` at that point.
+    // Keep self-lint in the test aggregate so regressions break the normal gate.
     const lint_smoke = b.addRunArtifact(exe);
     lint_smoke.addDirectoryArg(b.path("src"));
     lint_smoke.addFileArg(b.path("build.zig"));
     addPathInputs(b, lint_smoke, b.path("src"));
     addPathInputs(b, lint_smoke, b.path("build.zig"));
-    lint_smoke.expectExitCode(1);
+    lint_smoke.expectExitCode(0);
     test_step.dependOn(&lint_smoke.step);
 }
 
@@ -133,10 +123,10 @@ fn getVersion(b: *std.Build) []const u8 {
     const trimmed = std.mem.trim(u8, git_describe, " \n\r");
     const without_v = if (trimmed.len > 0 and trimmed[0] == 'v') trimmed[1..] else trimmed;
 
-    if (std.mem.indexOfScalar(u8, without_v, '-')) |dash_idx| {
+    if (std.mem.findScalar(u8, without_v, '-')) |dash_idx| {
         const tag_part = without_v[0..dash_idx];
         const rest = without_v[dash_idx + 1 ..];
-        if (std.mem.indexOfScalar(u8, rest, '-')) |second_dash| {
+        if (std.mem.findScalar(u8, rest, '-')) |second_dash| {
             const count = rest[0..second_dash];
             const hash = rest[second_dash + 1 ..];
             const hash_without_g = if (hash.len > 0 and hash[0] == 'g') hash[1..] else hash;
