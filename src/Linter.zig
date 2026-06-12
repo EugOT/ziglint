@@ -28,10 +28,10 @@ const Linter = @This();
 /// in Linter is diagnostic-only (perf debug), so we degrade reads to 0 here and
 /// leave the wider Io plumbing for a follow-up refactor.
 const Timer = struct {
-    pub fn start() error{}!Timer {
+    fn start() error{}!Timer {
         return .{};
     }
-    pub fn read(_: *Timer) u64 {
+    fn read(_: *Timer) u64 {
         return 0;
     }
 };
@@ -983,7 +983,7 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
         // Builtin type constructors
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(node));
-            break :blk std.mem.eql(u8, token, "@Type");
+            break :blk isBuiltinTypeConstructor(token);
         },
         // Identifier referencing another type (type alias)
         .identifier => blk: {
@@ -1074,6 +1074,38 @@ fn isBuiltinType(name: []const u8) bool {
         "f16",          "f32",            "f64",  "f80",      "f128",    "bool",
         "void",         "noreturn",       "type", "anyerror", "anytype", "anyframe",
         "comptime_int", "comptime_float",
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+fn isBuiltinTypeConstructor(name: []const u8) bool {
+    const builtins = [_][]const u8{
+        "@This",
+        "@import",
+        "@Type",
+        "@TypeOf",
+        "@Int",
+        "@Float",
+        "@Pointer",
+        "@Array",
+        "@Vector",
+        "@Optional",
+        "@ErrorUnion",
+        "@ErrorSet",
+        "@Enum",
+        // @EnumLiteral() type and @Tuple(comptime field_types: []const type) type
+        // are documented Zig 0.16 type-constructor builtins (langref §@EnumLiteral,
+        // §@Tuple). They return `type`, so they belong in this list.
+        "@EnumLiteral",
+        "@Union",
+        "@Struct",
+        "@Opaque",
+        "@Fn",
+        "@Frame",
+        "@Tuple",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
@@ -2404,7 +2436,7 @@ fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: b
         const full_expr = self.getNodeSource(node);
         const type_name = self.tree.tokenSlice(type_token);
         // Find where the type name ends and extract the { ... } part
-        const brace_start = std.mem.indexOf(u8, full_expr, "{") orelse return;
+        const brace_start = std.mem.find(u8, full_expr, "{") orelse return;
         const fields_part = truncateExpr(full_expr[brace_start..]);
         const full_truncated = truncateExpr(full_expr);
         const msg = std.fmt.allocPrint(self.allocator, ".{s}\x00{s}", .{ fields_part, full_truncated }) catch return;
@@ -2457,7 +2489,7 @@ fn truncateExpr(expr: []const u8) []const u8 {
     const max_len = 32;
     if (expr.len <= max_len) return expr;
     // Find a good break point (after opening brace if present)
-    if (std.mem.indexOf(u8, expr[0..@min(max_len, expr.len)], "{")) |brace| {
+    if (std.mem.find(u8, expr[0..@min(max_len, expr.len)], "{")) |brace| {
         return expr[0 .. brace + 1];
     }
     return expr[0..max_len];
@@ -2691,10 +2723,7 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
-            break :blk std.mem.eql(u8, token, "@This") or
-                std.mem.eql(u8, token, "@import") or
-                std.mem.eql(u8, token, "@Type") or
-                std.mem.eql(u8, token, "@TypeOf");
+            break :blk isBuiltinTypeConstructor(token);
         },
         .call_one, .call_one_comma => blk: {
             // Check if calling a PascalCase function (type constructor)
@@ -2819,9 +2848,9 @@ fn isIgnored(self: *Linter, line: usize, rule: rules.Rule) bool {
 }
 
 fn lineHasIgnore(_: *Linter, line_text: []const u8, rule: rules.Rule) bool {
-    if (std.mem.indexOf(u8, line_text, "// ziglint-ignore:")) |idx| {
+    if (std.mem.find(u8, line_text, "// ziglint-ignore:")) |idx| {
         const ignore_part = line_text[idx + 18 ..];
-        if (std.mem.indexOf(u8, ignore_part, rule.code()) != null) return true;
+        if (std.mem.find(u8, ignore_part, rule.code()) != null) return true;
     }
     return false;
 }
@@ -3099,8 +3128,8 @@ test "Z006: allow type alias with @import()" {
     }
 }
 
-test "Z006: allow type alias with @Type()" {
-    var linter: Linter = .init(std.testing.allocator, "const MyType = @Type(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });", "test.zig", null);
+test "Z006: allow type alias with @Int()" {
+    var linter: Linter = .init(std.testing.allocator, "const MyType = @Int(.unsigned, 8);", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
@@ -3181,12 +3210,10 @@ test "Z006: allow type alias with primitive type" {
 test "Z006: allow PascalCase labeled block type alias" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Config = blk: {
-        \\    break :blk @Type(.{ .@"struct" = .{
-        \\        .layout = .auto,
-        \\        .fields = &.{},
-        \\        .decls = &.{},
-        \\        .is_tuple = false,
-        \\    } });
+        \\    const field_names = [_][]const u8{};
+        \\    const field_types = [_]type{};
+        \\    const field_attrs = [_]std.builtin.Type.StructField.Attributes{};
+        \\    break :blk @Struct(.auto, null, &field_names, &field_types, &field_attrs);
         \\};
     , "test.zig", null);
     defer linter.deinit();
@@ -3526,7 +3553,7 @@ test "Z011: detect deprecated method call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3570,7 +3597,7 @@ test "Z011: no warning for non-deprecated method" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3624,7 +3651,7 @@ test "Z011: detect deprecated direct function call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3663,7 +3690,7 @@ test "Z011: detect deprecated function alias" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3703,7 +3730,7 @@ test "Z011: detect deprecated type function" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3744,7 +3771,7 @@ test "Z011: detect deprecated type function alias" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3783,9 +3810,9 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
+        const start_idx = std.mem.find(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        const end_idx = std.mem.findPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
         break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
@@ -3807,7 +3834,7 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, zig_lib_path);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, zig_lib_path);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3846,9 +3873,9 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
+        const start_idx = std.mem.find(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        const end_idx = std.mem.findPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
         break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
@@ -3999,7 +4026,7 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
         const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
         defer std.testing.allocator.free(path);
 
-        var graph = try ModuleGraph.init(io, std.testing.allocator, path, zig_lib_path);
+        var graph = try ModuleGraph.init(std.testing.allocator, io, path, zig_lib_path);
         defer graph.deinit();
 
         var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4683,7 +4710,7 @@ test "Z023: argument order - aliased Allocator" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4717,7 +4744,7 @@ test "Z023: argument order - aliased Io" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4785,7 +4812,7 @@ test "Z023: receiver param with struct name is ok (semantic)" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4817,7 +4844,7 @@ test "Z023: file-as-struct receiver is ok (semantic)" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "Terminal.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5188,7 +5215,7 @@ test "Z027: flag instance accessing const" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5229,7 +5256,7 @@ test "Z027: flag instance accessing static fn" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5272,7 +5299,7 @@ test "Z027: allow instance method call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5309,7 +5336,7 @@ test "Z027: allow field access" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5346,7 +5373,7 @@ test "Z027: allow type-level access" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5406,7 +5433,7 @@ test "Z027: allow method with Self receiver" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5446,7 +5473,7 @@ test "Z027: allow method with named type receiver" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5538,7 +5565,7 @@ test "Z029: detect redundant @as in method call arg" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);

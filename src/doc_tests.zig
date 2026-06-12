@@ -36,7 +36,7 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
 
     // Parse frontmatter for rule identifier
     if (std.mem.startsWith(u8, content, "---\n")) {
-        if (std.mem.indexOf(u8, content[4..], "\n---")) |end| {
+        if (std.mem.find(u8, content[4..], "\n---")) |end| {
             const frontmatter = content[4..][0..end];
             var lines = std.mem.splitScalar(u8, frontmatter, '\n');
             while (lines.next()) |line| {
@@ -51,7 +51,7 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
     // Find all zig code blocks
     var line_num: usize = 1;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, content, pos, "```zig\n")) |start| {
+    while (std.mem.findPos(u8, content, pos, "```zig\n")) |start| {
         // Count lines up to this point
         for (content[pos..start]) |c| {
             if (c == '\n') line_num += 1;
@@ -59,14 +59,14 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
         line_num += 1; // for the ```zig line
 
         const code_start = start + 7;
-        if (std.mem.indexOfPos(u8, content, code_start, "\n```")) |end| {
+        if (std.mem.findPos(u8, content, code_start, "\n```")) |end| {
             const code = content[code_start..end];
 
             // Parse expected rules from `// expect: ZXXX` comments
             var expected: std.ArrayList(rules.Rule) = .empty;
             var code_lines = std.mem.splitScalar(u8, code, '\n');
             while (code_lines.next()) |code_line| {
-                if (std.mem.indexOf(u8, code_line, "// expect:")) |expect_pos| {
+                if (std.mem.find(u8, code_line, "// expect:")) |expect_pos| {
                     var expect_str = code_line[expect_pos + 10 ..];
                     expect_str = std.mem.trim(u8, expect_str, " ");
                     // Handle multiple expectations: `// expect: Z001, Z002`
@@ -111,7 +111,7 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
     defer allocator.free(path);
 
     // Try to create ModuleGraph for semantic analysis (may fail for invalid code)
-    var graph: ?ModuleGraph = ModuleGraph.init(io, allocator, path, null) catch null;
+    var graph: ?ModuleGraph = ModuleGraph.init(allocator, io, path, null) catch null;
     defer if (graph) |*g| g.deinit();
 
     var resolver: ?TypeResolver = if (graph) |*g| TypeResolver.init(allocator, g) else null;
