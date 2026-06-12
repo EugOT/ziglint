@@ -491,8 +491,22 @@ fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: [
     return self.findMethodInType(tree, type_node, method_name, mod.path);
 }
 
+/// Alias chains (`const a = b;`) are followed at most this many hops so
+/// cyclic aliases (`const a = b; const b = a;`) cannot recurse unbounded.
+const max_alias_depth = 32;
+
 /// For file-as-struct modules (like fs/File.zig), look for methods in root declarations.
 fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method_name: []const u8) ?MethodDef {
+    return self.findMethodInFileAsStructDepth(module_path, method_name, 0);
+}
+
+fn findMethodInFileAsStructDepth(
+    self: *TypeResolver,
+    module_path: []const u8,
+    method_name: []const u8,
+    depth: u32,
+) ?MethodDef {
+    if (depth >= max_alias_depth) return null;
     self.graph.addModulePublic(module_path);
     const mod = self.graph.getModule(module_path) orelse return null;
     const tree = &mod.tree;
@@ -530,7 +544,7 @@ fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method
                 // It's an alias like `const ArrayListUnmanaged = ArrayList;`
                 // Follow the alias to find the actual function
                 const alias_target = tree.tokenSlice(tree.nodeMainToken(init_node));
-                return self.findMethodInFileAsStruct(module_path, alias_target);
+                return self.findMethodInFileAsStructDepth(module_path, alias_target, depth + 1);
             } else if (init_tag == .fn_decl) {
                 // Inline function definition
                 var buf: [1]Ast.Node.Index = undefined;
@@ -822,9 +836,10 @@ fn resolveFieldAccess(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
             return .{ .std_type = .{ .path = full_path } };
         },
         .user_type => {
-            // Accessing a field on a user type - could be a nested type
-            const full_path = self.buildStdTypePath(tree, node);
-            return .{ .std_type = .{ .path = full_path } };
+            // A field access on a user-defined type is not a stdlib type.
+            // Coercing it into `.std_type` conflated user namespaces with
+            // `std` ones and misrouted downstream semantic resolution.
+            return .unknown;
         },
         .unknown => {
             const lhs_tag = tree.nodeTag(lhs_node);
