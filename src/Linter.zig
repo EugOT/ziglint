@@ -1884,6 +1884,10 @@ fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.N
     // Check if the return expression is a try
     if (self.tree.nodeTag(return_expr) != .@"try") return;
 
+    // In `!?T` functions, `try` can be required to coerce `!T` into `!?T`:
+    // the `try` unwraps the error union, then `return` coerces `T` to `?T`.
+    if (self.currentReturnTypeMayNeedTryForOptionalPayload()) return;
+
     // Get the inner expression being tried
     const try_expr = self.tree.nodeData(return_expr).node;
     const expr_source = self.getNodeSource(try_expr);
@@ -1891,6 +1895,23 @@ fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.N
 
     const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
     self.report(loc, .Z017, truncated);
+}
+
+fn currentReturnTypeMayNeedTryForOptionalPayload(self: *Linter) bool {
+    const fn_return_type = self.current_fn_return_type.unwrap() orelse return false;
+    const tag = self.tree.nodeTag(fn_return_type);
+
+    // Bare `!?T` function returns store only the payload node in FnProto.return_type;
+    // the `!` is the token immediately before the optional payload.
+    if (tag == .optional_type) {
+        const first_token = self.tree.firstToken(fn_return_type);
+        return first_token > 0 and self.tree.tokenTag(first_token - 1) == .bang;
+    }
+
+    if (tag != .error_union) return false;
+
+    const data = self.tree.nodeData(fn_return_type).node_and_node;
+    return self.tree.nodeTag(data[1]) == .optional_type;
 }
 
 fn checkCatchReturnAll(self: *Linter) void {
@@ -4375,6 +4396,35 @@ test "Z016: simple assert is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z016);
     }
+}
+
+test "Z017: detect redundant try in return" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn bar() !u32 {
+        \\    return 1;
+        \\}
+        \\fn foo() !u32 {
+        \\    return try bar();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z017));
+}
+
+test "Z017: allow try when error union payload coerces to optional return" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Thing = struct {};
+        \\fn allocThing() !Thing {
+        \\    return .{};
+        \\}
+        \\fn foo() !?Thing {
+        \\    return try allocThing();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z017));
 }
 
 test "Z019: @This() in named struct should warn" {
