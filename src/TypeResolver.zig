@@ -1139,10 +1139,18 @@ fn resolveNumberLiteral(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index
 }
 
 fn nodeIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+    return self.nodeIsTypeRefDepth(tree, node, module_path, 0);
+}
+
+fn nodeIsTypeRefDepth(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8, depth: u32) bool {
+    // Cyclic aliases (`const a = b; const b = a;`) would otherwise recurse
+    // unbounded through varDeclIsTypeRef/identifierIsTypeRef. ziglint analyzes
+    // untrusted source, so bound the alias chain like findMethodInFileAsStruct.
+    if (depth >= max_alias_depth) return false;
     return switch (tree.nodeTag(node)) {
-        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.varDeclIsTypeRef(tree, node, module_path),
-        .identifier => self.identifierIsTypeRef(tree, node, module_path),
-        .field_access => self.fieldAccessIsTypeRef(tree, node, module_path),
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.varDeclIsTypeRef(tree, node, module_path, depth),
+        .identifier => self.identifierIsTypeRef(tree, node, module_path, depth),
+        .field_access => self.fieldAccessIsTypeRef(tree, node, module_path, depth),
         .builtin_call_two, .builtin_call_two_comma => self.builtinCallIsTypeRef(tree, node),
         .container_decl,
         .container_decl_trailing,
@@ -1167,7 +1175,7 @@ fn nodeIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, mo
     };
 }
 
-fn varDeclIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+fn varDeclIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8, depth: u32) bool {
     const var_decl = tree.fullVarDecl(node) orelse return false;
     if (var_decl.ast.type_node.unwrap()) |type_node| {
         if (tree.nodeTag(type_node) == .identifier) {
@@ -1176,10 +1184,10 @@ fn varDeclIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index,
         return false;
     }
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
-    return self.nodeIsTypeRef(tree, init_node, module_path);
+    return self.nodeIsTypeRefDepth(tree, init_node, module_path, depth + 1);
 }
 
-fn identifierIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+fn identifierIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8, depth: u32) bool {
     const name = tree.tokenSlice(tree.nodeMainToken(node));
     if (resolvePrimitiveType(name) != null) return true;
     if (std.mem.eql(u8, name, "type")) return true;
@@ -1189,7 +1197,11 @@ fn identifierIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Ind
                 const var_decl = tree.fullVarDecl(decl_node) orelse continue;
                 const name_token = var_decl.ast.mut_token + 1;
                 if (!std.mem.eql(u8, tree.tokenSlice(name_token), name)) continue;
-                return self.varDeclIsTypeRef(tree, decl_node, module_path);
+                // Don't increment here: the alias-following recursion in
+                // varDeclIsTypeRef (init_node) is the single hop that consumes
+                // depth, so one alias link costs exactly one increment and
+                // max_alias_depth means ~32 links rather than ~16.
+                return self.varDeclIsTypeRef(tree, decl_node, module_path, depth);
             },
             else => {},
         }
@@ -1197,9 +1209,9 @@ fn identifierIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Ind
     return false;
 }
 
-fn fieldAccessIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+fn fieldAccessIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8, depth: u32) bool {
     const data = tree.nodeData(node).node_and_token;
-    if (!self.nodeIsTypeRef(tree, data[0], module_path)) return false;
+    if (!self.nodeIsTypeRefDepth(tree, data[0], module_path, depth + 1)) return false;
     const type_info = self.resolveFieldAccess(tree, node, module_path);
     return switch (type_info) {
         .std_type, .user_type, .type_type => true,
@@ -2059,4 +2071,87 @@ test "findFnInCurrentModule: const alias to function" {
     defer if (doc) |d| std.testing.allocator.free(d);
     try std.testing.expect(doc != null);
     try std.testing.expect(std.mem.find(u8, doc.?, "Deprecated") != null);
+}
+
+test "findFnInCurrentModule: cyclic method alias terminates via max_alias_depth" {
+    // Exercises the depth guard in findMethodInFileAsStructDepth: a cyclic
+    // method-alias chain must return null instead of recursing unbounded.
+    const source =
+        \\pub const aliasA = aliasB;
+        \\pub const aliasB = aliasA;
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    // Must terminate (not stack-overflow) and find no concrete function.
+    const method_def = resolver.findFnInCurrentModule(path, "aliasA");
+    try std.testing.expect(method_def == null);
+}
+
+test "isTypeRef: cyclic alias terminates without stack overflow" {
+    // A linter analyzes untrusted source, so a cyclic alias must not recurse
+    // unbounded through nodeIsTypeRef -> identifierIsTypeRef -> varDeclIsTypeRef.
+    const source =
+        \\const a = b;
+        \\const b = a;
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const mod = graph.getModule(path).?;
+    const root_decls = mod.tree.rootDecls();
+    const var_decl = mod.tree.fullVarDecl(root_decls[0]).?;
+    const init_node = var_decl.ast.init_node.unwrap().?;
+    // Must return (not crash) and report not-a-type, since the cycle resolves to nothing.
+    try std.testing.expect(!resolver.isTypeRef(path, init_node));
+}
+
+test "isTypeRef: self-referential alias terminates without stack overflow" {
+    const source =
+        \\const a = a;
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = testIo();
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const mod = graph.getModule(path).?;
+    const root_decls = mod.tree.rootDecls();
+    const var_decl = mod.tree.fullVarDecl(root_decls[0]).?;
+    const init_node = var_decl.ast.init_node.unwrap().?;
+    try std.testing.expect(!resolver.isTypeRef(path, init_node));
 }
