@@ -1197,7 +1197,11 @@ fn identifierIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Ind
                 const var_decl = tree.fullVarDecl(decl_node) orelse continue;
                 const name_token = var_decl.ast.mut_token + 1;
                 if (!std.mem.eql(u8, tree.tokenSlice(name_token), name)) continue;
-                return self.varDeclIsTypeRef(tree, decl_node, module_path, depth + 1);
+                // Don't increment here: the alias-following recursion in
+                // varDeclIsTypeRef (init_node) is the single hop that consumes
+                // depth, so one alias link costs exactly one increment and
+                // max_alias_depth means ~32 links rather than ~16.
+                return self.varDeclIsTypeRef(tree, decl_node, module_path, depth);
             },
             else => {},
         }
