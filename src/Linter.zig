@@ -2077,6 +2077,36 @@ fn getAsTypeName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
     return self.getTypeNodeName(params[0]);
 }
 
+/// Source text of an `@as(T, ...)` cast's type node, for comparison against a
+/// field's declared type. Unlike getAsTypeName this also covers composite types
+/// (`*u32`, `?T`, `[N]T`, `a.b.C`); pair it with typeTextEql for whitespace-
+/// insensitive comparison so Z029 detects redundant casts on all field types.
+fn getAsTypeText(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(node);
+    if (tag != .builtin_call_two and tag != .builtin_call_two_comma and
+        tag != .builtin_call and tag != .builtin_call_comma) return null;
+    if (!std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(node)), "@as")) return null;
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = self.tree.builtinCallParams(&buf, node) orelse return null;
+    if (params.len < 1) return null;
+    return self.tree.getNodeSource(params[0]);
+}
+
+/// Whitespace-insensitive equality of two type source strings, so `[3]u8` and
+/// `[3] u8` (or differently-spaced field/cast types) compare equal.
+fn typeTextEql(a: []const u8, b: []const u8) bool {
+    var ia: usize = 0;
+    var ib: usize = 0;
+    while (true) {
+        while (ia < a.len and std.ascii.isWhitespace(a[ia])) ia += 1;
+        while (ib < b.len and std.ascii.isWhitespace(b[ib])) ib += 1;
+        if (ia >= a.len or ib >= b.len) return ia >= a.len and ib >= b.len;
+        if (a[ia] != b[ib]) return false;
+        ia += 1;
+        ib += 1;
+    }
+}
+
 fn getTypeNodeName(self: *Linter, type_node: Ast.Node.Index) ?[]const u8 {
     const tag = self.tree.nodeTag(type_node);
     return switch (tag) {
@@ -2203,7 +2233,7 @@ fn checkRedundantAsInStructInit(self: *Linter, node: Ast.Node.Index) void {
     const struct_type_name = self.resolveStructInitTypeName(node, struct_init) orelse return;
 
     for (struct_init.ast.fields) |field_value| {
-        const as_type_name = self.getAsTypeName(field_value) orelse continue;
+        const as_type_text = self.getAsTypeText(field_value) orelse continue;
 
         // Get field name: token before '=' before the value expression
         const value_main_token = self.tree.nodeMainToken(field_value);
@@ -2212,10 +2242,10 @@ fn checkRedundantAsInStructInit(self: *Linter, node: Ast.Node.Index) void {
         if (self.tree.tokenTag(field_name_token) != .identifier) continue;
         const field_name = self.tree.tokenSlice(field_name_token);
 
-        const field_type_name = self.findContainerFieldType(struct_type_name, field_name) orelse continue;
-        if (std.mem.eql(u8, as_type_name, field_type_name)) {
+        const field_type_text = self.findContainerFieldType(struct_type_name, field_name) orelse continue;
+        if (typeTextEql(as_type_text, field_type_text)) {
             const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(field_value));
-            self.report(loc, .Z029, as_type_name);
+            self.report(loc, .Z029, as_type_text);
         }
     }
 }
@@ -2261,11 +2291,11 @@ fn findContainerFieldTypeInTree(self: *Linter, tree: *const Ast, struct_type_nam
                     const field = tree.fullContainerField(member) orelse continue;
                     if (!std.mem.eql(u8, tree.tokenSlice(field.ast.main_token), field_name)) continue;
                     const type_node = field.ast.type_expr.unwrap() orelse return null;
-                    const field_type_tag = tree.nodeTag(type_node);
-                    return switch (field_type_tag) {
-                        .identifier => tree.tokenSlice(tree.nodeMainToken(type_node)),
-                        else => null,
-                    };
+                    // Return the field type's raw source text. Comparison in
+                    // checkRedundantAsInStructInit normalizes whitespace, so this
+                    // handles composite types (`*u32`, `?T`, `[N]T`, `a.b.C`) too,
+                    // not just bare identifiers (Z029 false negatives otherwise).
+                    return tree.getNodeSource(type_node);
                 }
             },
             else => {},
@@ -5608,6 +5638,68 @@ test "Z029: detect redundant @as in struct field init" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as for pointer-typed struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    p: *u32,
+        \\};
+        \\pub fn main() void {
+        \\    var n: u32 = 0;
+        \\    const f: Foo = .{ .p = @as(*u32, &n) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as for optional-typed struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    o: ?u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .o = @as(?u32, 42) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as for array-typed struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: [3]u8,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .a = @as([3]u8, .{ 1, 2, 3 }) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different pointer type in struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    p: *u32,
+        \\};
+        \\pub fn main() void {
+        \\    var n: u16 = 0;
+        \\    const f: Foo = .{ .p = @as(*u16, &n) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
 }
 
 test "Z029: allow @as with different type in struct field init" {

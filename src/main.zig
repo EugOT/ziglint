@@ -64,9 +64,14 @@ pub fn main(init: std.process.Init) !u8 {
         else => return err,
     };
 
-    // Load config file from first CLI path (or current directory)
+    // Load config file from first CLI path (or current directory).
+    // Log before falling back to defaults so config-discovery failures (e.g. an
+    // allocation error while joining the search path) aren't swallowed silently.
     const start_path = if (config.paths.len > 0) config.paths[0] else null;
-    config.file_config = FileConfig.load(cfg_alloc, io, start_path) catch .{};
+    config.file_config = FileConfig.load(cfg_alloc, io, start_path) catch |err| blk: {
+        try stderr.interface.print("warning: failed to load config: {}\n", .{err});
+        break :blk .{};
+    };
 
     applyOnlyRules(&config);
 
@@ -305,7 +310,13 @@ fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig
     };
     defer walker.deinit();
 
-    while (walker.next(io) catch null) |entry| {
+    while (walker.next(io) catch |err| blk: {
+        // Report instead of silently ending traversal: a permission error or
+        // symlink loop mid-walk would otherwise drop the rest of the tree with
+        // no diagnostic, leaving files un-linted without the user knowing.
+        try writer.print("warning: stopped walking '{s}': {}\n", .{ path, err });
+        break :blk null;
+    }) |entry| {
         if (shouldSkip(entry.path, gitignore)) continue;
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
