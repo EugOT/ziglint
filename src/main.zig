@@ -284,7 +284,13 @@ fn lintPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_
         return lintDirectory(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
     }
 
+    if (!isZigSourcePath(path)) return 0;
+
     return lintFile(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
+}
+
+fn isZigSourcePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, std.fs.path.basename(path), ".zig");
 }
 
 fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
@@ -647,6 +653,13 @@ test "applyOnlyRules keeps ignore precedence" {
     try std.testing.expect(config.file_config.isRuleEnabled(.Z001));
     try std.testing.expect(!config.file_config.isRuleEnabled(.Z002));
     try std.testing.expect(!config.file_config.isRuleEnabled(.Z003));
+}
+
+test "isZigSourcePath accepts only Zig source files" {
+    try std.testing.expect(isZigSourcePath("src/main.zig"));
+    try std.testing.expect(isZigSourcePath("build.zig"));
+    try std.testing.expect(!isZigSourcePath("build.zig.zon"));
+    try std.testing.expect(!isZigSourcePath("README.md"));
 }
 
 /// Test-only Io provider matching the convention used by ModuleGraph/TypeResolver.
