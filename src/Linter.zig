@@ -374,7 +374,7 @@ fn buildParentMap(self: *Linter) void {
 }
 
 const ChildList = struct {
-    items: [8]Ast.Node.Index = undefined,
+    items: [32]Ast.Node.Index = undefined,
     len: usize = 0,
 
     fn append(self: *ChildList, item: Ast.Node.Index) void {
@@ -525,6 +525,22 @@ fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
             const data = self.tree.nodeData(node).node_and_node;
             children.append(data[0]); // The expression being caught
             children.append(data[1]); // The catch body
+        },
+
+        .@"switch", .switch_comma => {
+            const full_switch = self.tree.fullSwitch(node) orelse return children;
+            children.append(full_switch.ast.condition);
+            for (full_switch.ast.cases) |case| children.append(case);
+        },
+
+        .switch_case_one,
+        .switch_case_inline_one,
+        .switch_case,
+        .switch_case_inline,
+        => {
+            const case = self.tree.fullSwitchCase(node) orelse return children;
+            for (case.ast.values) |value| children.append(value);
+            children.append(case.ast.target_expr);
         },
 
         else => {},
@@ -905,14 +921,16 @@ fn buildPublicTypesMap(self: *Linter) void {
 fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
 
-    // Use type resolver if available
+    // Use type resolver if available. An unresolved semantic query must not
+    // suppress the syntactic fallback below; module aliases such as
+    // `const StorageError = mod.StorageError` are often public imported API.
     if (self.type_resolver) |resolver| {
         if (self.module_path) |mod_path| {
             const type_info = resolver.typeOf(mod_path, init_node);
-            return switch (type_info) {
-                .type_type, .std_type, .user_type => true,
-                else => false,
-            };
+            switch (type_info) {
+                .type_type, .std_type, .user_type => return true,
+                else => {},
+            }
         }
     }
 
@@ -972,6 +990,8 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
         => true,
         // Error union types (e.g., E!T)
         .error_union => true,
+        // Composed error sets (e.g., error{A} || std.mem.Allocator.Error)
+        .merge_error_sets => true,
         // Error set declarations (e.g., error{A, B})
         .error_set_decl => true,
         // Function types
@@ -1013,11 +1033,29 @@ fn isPrivateTypeRef(self: *Linter, name: []const u8, enclosing_container: Ast.No
     if (isBuiltinType(name)) return false;
     if (self.public_types.contains(name)) return false;
     if (self.imported_types.contains(name)) return false;
+    if (std.mem.eql(u8, name, "Self") and enclosing_container.unwrap() != null) return false;
+    if (self.enclosingContainerName(enclosing_container)) |container_name| {
+        if (std.mem.eql(u8, name, container_name)) return false;
+    }
     // Don't flag Self type (type matching filename for file-as-struct pattern)
     if (self.isSelfType(name)) return false;
     // Check if type is pub within the enclosing container
     if (self.isPublicInContainer(name, enclosing_container)) return false;
     return true;
+}
+
+fn enclosingContainerName(self: *Linter, container_opt: Ast.Node.OptionalIndex) ?[]const u8 {
+    const container = container_opt.unwrap() orelse return null;
+    if (self.parent_map.len == 0) return null;
+    const parent = self.parent_map[@intFromEnum(container)].unwrap() orelse return null;
+    return switch (self.tree.nodeTag(parent)) {
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => blk: {
+            const var_decl = self.tree.fullVarDecl(parent) orelse break :blk null;
+            const name_token = var_decl.ast.mut_token + 1;
+            break :blk self.tree.tokenSlice(name_token);
+        },
+        else => null,
+    };
 }
 
 /// Check if a type name is declared as `pub const` within the given container
@@ -1584,7 +1622,7 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
             const loc = self.tree.tokenLocation(0, name_token);
             self.report(loc, .Z005, name);
         }
-    } else {
+    } else if (!self.isExportedFunction(fn_proto)) {
         if (!isValidFunctionName(name)) {
             const loc = self.tree.tokenLocation(0, name_token);
             self.report(loc, .Z001, name);
@@ -1636,6 +1674,11 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
     self.checkDeinitUndefined(node, fn_proto);
 }
 
+fn isExportedFunction(self: *Linter, fn_proto: Ast.full.FnProto) bool {
+    const token = fn_proto.extern_export_inline_token orelse return false;
+    return self.tree.tokenTag(token) == .keyword_export;
+}
+
 fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.FnProto) void {
     if (!self.config.isRuleEnabled(.Z030)) return;
 
@@ -1668,6 +1711,7 @@ fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.
 
     // Check if last statement is `self.* = undefined;`
     if (self.lastStatementIsSelfUndefined(body_node, param_name)) return;
+    if (self.lastStatementsAreSelfUndefinedThenDestroy(body_node, param_name)) return;
 
     // None of the valid patterns found
     const loc = self.tree.tokenLocation(0, name_token);
@@ -1741,6 +1785,23 @@ fn lastStatementIsSelfUndefined(self: *Linter, body_node: Ast.Node.Index, param_
 
     const last_stmt = stmts[stmts.len - 1];
     return self.isSelfUndefinedAssign(last_stmt, param_name);
+}
+
+fn lastStatementsAreSelfUndefinedThenDestroy(self: *Linter, body_node: Ast.Node.Index, param_name: []const u8) bool {
+    var buf: [2]Ast.Node.Index = undefined;
+    const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
+    if (stmts.len < 2) return false;
+
+    const poison_stmt = stmts[stmts.len - 2];
+    const destroy_stmt = stmts[stmts.len - 1];
+    return self.isSelfUndefinedAssign(poison_stmt, param_name) and self.isDestroySelfCall(destroy_stmt, param_name);
+}
+
+fn isDestroySelfCall(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
+    const source = self.getNodeSource(node);
+    if (std.mem.indexOf(u8, source, ".destroy(") == null) return false;
+    if (std.mem.indexOf(u8, source, param_name) == null) return false;
+    return true;
 }
 
 fn isSelfUndefinedAssign(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
@@ -1910,7 +1971,7 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
 
 fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
-    self.checkRedundantType(return_expr, true);
+    self.checkRedundantType(return_expr, self.returnFieldAccessMatchesReturnType(return_expr), false);
 
     if (self.rule_timer) |*t| {
         const start = t.read();
@@ -1921,6 +1982,19 @@ fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     }
 
     self.checkRedundantAsInReturn(node, return_expr);
+}
+
+fn returnFieldAccessMatchesReturnType(self: *Linter, return_expr: Ast.Node.Index) bool {
+    if (self.tree.nodeTag(return_expr) != .field_access) return false;
+
+    const data = self.tree.nodeData(return_expr).node_and_token;
+    const lhs = data[0];
+    if (self.tree.nodeTag(lhs) != .identifier) return false;
+    const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
+
+    const fn_return_type = self.current_fn_return_type.unwrap() orelse return false;
+    const fn_return_name = self.getTypeNodeName(fn_return_type) orelse return false;
+    return std.mem.eql(u8, lhs_name, fn_return_name);
 }
 
 fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
@@ -2309,7 +2383,7 @@ fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
     const call = self.tree.fullCall(&buf, node) orelse return;
     for (call.ast.params) |arg| {
         // Don't check field_access in call args - can't distinguish type params from enum values
-        self.checkRedundantType(arg, false);
+        self.checkRedundantType(arg, false, true);
     }
 }
 
@@ -2453,13 +2527,14 @@ fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
     self.report(loc, .Z016, "and");
 }
 
-fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
+fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool, in_call_arg: bool) void {
     const tag = self.tree.nodeTag(node);
 
     if (isExplicitStructInit(tag)) {
         var buf: [2]Ast.Node.Index = undefined;
         const struct_init = self.tree.fullStructInit(&buf, node) orelse return;
         const type_node = struct_init.ast.type_expr.unwrap() orelse return;
+        if (in_call_arg and self.typeDeclHasCallableMembers(type_node)) return;
         const type_token = self.tree.nodeMainToken(type_node);
         const loc = self.tree.tokenLocation(0, type_token);
         // Get the fields part (everything after the type name)
@@ -2536,6 +2611,33 @@ fn isExplicitStructInit(tag: Ast.Node.Tag) bool {
     };
 }
 
+fn typeDeclHasCallableMembers(self: *Linter, type_node: Ast.Node.Index) bool {
+    const type_name = self.getTypeNodeName(type_node) orelse return false;
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(node);
+        switch (tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = self.tree.fullVarDecl(node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                const decl_name = self.tree.tokenSlice(name_token);
+                if (!std.mem.eql(u8, decl_name, type_name)) continue;
+
+                const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+                if (!self.isTypeExpression(init_node)) continue;
+                const members = self.getContainerMembers(init_node) orelse continue;
+                for (members) |member| {
+                    if (self.tree.nodeTag(member) == .fn_decl) return true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    return false;
+}
+
 fn isValidFunctionName(name: []const u8) bool {
     if (name.len == 0) return false;
     // Must start with lowercase letter
@@ -2582,6 +2684,7 @@ fn hasUnderscorePrefix(name: []const u8) bool {
 /// Returns the suggested fix if there's an issue, null otherwise.
 fn checkAcronymCasing(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     if (name.len < 2) return null;
+    if (std.mem.indexOfScalar(u8, name, '_') != null) return null;
 
     // Find sequences of 2+ uppercase letters that should be title-cased
     // XMLParser -> XmlParser (XML at start)
@@ -2911,8 +3014,9 @@ fn checkLineLength(self: *Linter) void {
 
     for (self.source, 0..) |c, i| {
         if (c == '\n') {
-            const line_len = i - line_start;
-            if (line_len > max_len) {
+            const line = self.source[line_start..i];
+            const line_len = line.len;
+            if (line_len > max_len and !shouldSkipLineLength(line)) {
                 // Format: "actual_len\x00max_len" for the error message
                 const context = std.fmt.allocPrint(self.allocator, "{}\x00{}", .{ line_len, max_len }) catch continue;
                 self.allocated_contexts.append(self.allocator, context) catch {
@@ -2928,8 +3032,9 @@ fn checkLineLength(self: *Linter) void {
 
     // Check last line if not terminated with newline
     if (line_start < self.source.len) {
-        const line_len = self.source.len - line_start;
-        if (line_len > max_len) {
+        const line = self.source[line_start..];
+        const line_len = line.len;
+        if (line_len > max_len and !shouldSkipLineLength(line)) {
             const context = std.fmt.allocPrint(self.allocator, "{}\x00{}", .{ line_len, max_len }) catch return;
             self.allocated_contexts.append(self.allocator, context) catch {
                 self.allocator.free(context);
@@ -2938,6 +3043,29 @@ fn checkLineLength(self: *Linter) void {
             self.reportLineLength(line_num, context, max_len);
         }
     }
+}
+
+fn shouldSkipLineLength(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    return std.mem.startsWith(u8, trimmed, "//") or
+        std.mem.startsWith(u8, trimmed, "\\\\") or
+        hasStringLiteral(line);
+}
+
+fn hasStringLiteral(line: []const u8) bool {
+    var escaped = false;
+    for (line) |c| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') return true;
+    }
+    return false;
 }
 
 fn reportLineLength(self: *Linter, line: usize, context: []const u8, max_len: u32) void {
@@ -2993,6 +3121,20 @@ test "Z001: detect snake_case function" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: allow exported ABI snake_case function" {
+    var linter: Linter = .init(std.testing.allocator, "export fn my_func() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: allow public exported ABI snake_case function" {
+    var linter: Linter = .init(std.testing.allocator, "pub export fn my_func() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
 }
 
 test "Z001: allow underscore prefix (private)" {
@@ -3537,11 +3679,40 @@ test "Z010: allow anonymous struct in function arg" {
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
 }
 
+test "Z010: allow explicit method context struct in call arg" {
+    const source =
+        \\fn sort(_: anytype) void {}
+        \\fn foo() void {
+        \\    const SortCtx = struct {
+        \\        pub fn lessThan(_: @This(), _: usize, _: usize) bool {
+        \\            return false;
+        \\        }
+        \\        pub fn swap(_: @This(), _: usize, _: usize) void {}
+        \\    };
+        \\    sort(SortCtx{});
+        \\}
+    ;
+    var linter: Linter = .init(std.testing.allocator, source, "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
 test "Z010: detect explicit enum in return" {
     var linter: Linter = .init(std.testing.allocator, "fn foo() Mode { return Mode.fast; }", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow type field access when return type differs" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const TestHooks = struct { pub var next_code: u8 = 0; };
+        \\fn foo() u8 { return TestHooks.next_code; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
 }
 
 test "Z010: allow anonymous enum in return" {
@@ -4196,6 +4367,68 @@ test "Z012: pub fn using non-pub type from enclosing struct is error" {
     try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
 }
 
+test "Z012: container Self alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const Self = Foo;
+        \\    pub fn init() Self { return .{}; }
+        \\    pub fn update(self: *Self) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: own container name in method signature is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub fn init() Foo { return .{}; }
+        \\    pub fn update(self: *Foo) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: own enum name in method signature is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Report = struct {
+        \\    pub const Status = enum {
+        \\        success,
+        \\        failure,
+        \\        pub fn toString(self: Status) []const u8 {
+        \\            return switch (self) {
+        \\                .success => "success",
+        \\                .failure => "failure",
+        \\            };
+        \\        }
+        \\    };
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: root Self alias remains private" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Self = struct {};
+        \\pub fn init() Self { return .{}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
 test "Z012: pub fn returning builtin type is ok" {
     var linter: Linter = .init(std.testing.allocator,
         \\pub fn getValue() u32 { return 42; }
@@ -4302,6 +4535,48 @@ test "Z012: pub fn returning public error set is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z012);
     }
+}
+
+test "Z015: pub fn returning public composed error set is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const MyError = error{ InvalidInput } || std.mem.Allocator.Error;
+        \\pub fn parse() MyError!void { return {}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z015);
+    }
+}
+
+test "Z012/Z015: private aliases to imported public types are ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const storage = @import("storage.zig");
+        \\const PipelineRun = storage.PipelineRun;
+        \\const StorageError = storage.StorageError;
+        \\pub fn getRun() StorageError!PipelineRun {
+        \\    return undefined;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+        try std.testing.expect(d.rule != rules.Rule.Z015);
+    }
+}
+
+test "Z012: private identifier alias remains private" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\const Alias = Private;
+        \\pub fn getAlias() Alias { return .{}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
 }
 
 test "Z012: pub fn returning public if expression type is ok" {
@@ -4545,6 +4820,31 @@ test "Z019: @This() in local struct inside nested if blocks is ok" {
         \\                _ = Local;
         \\            }
         \\        }
+        \\    }
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z019: @This() in local struct inside switch arm is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(mode: enum { sparse, dense }) void {
+        \\    switch (mode) {
+        \\        .sparse => {
+        \\            const Event = struct {
+        \\                const Self = @This();
+        \\                pub fn lessThan(_: void, a: Self, b: Self) bool {
+        \\                    return a.pos < b.pos;
+        \\                }
+        \\                pos: u64,
+        \\            };
+        \\            _ = Event;
+        \\        },
+        \\        .dense => {},
         \\    }
         \\}
     , "test.zig", null);
@@ -4966,16 +5266,37 @@ test "Z023: comptime value before other is bad" {
     try std.testing.expect(found);
 }
 
-test "Z024: detect line exceeding 120 characters" {
-    // Line with 121 characters (11 + 108 + 2)
+test "Z024: detect code line exceeding 120 characters" {
+    var linter: Linter = .init(
+        std.testing.allocator,
+        "const very_long_code_line_that_should_still_be_wrapped_by_the_author = @as(u64, 1) + @as(u64, 2) + @as(u64, 3) + @as(u64, 4);\n",
+        "test.zig",
+        null,
+    );
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z024));
+}
+
+test "Z024: allow long string literal line" {
     var linter: Linter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    var found = false;
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z024) found = true;
-    }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
+}
+
+test "Z024: allow long comment line" {
+    var linter: Linter = .init(std.testing.allocator, "// aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
+}
+
+test "Z024: allow long raw string line" {
+    var linter: Linter = .init(std.testing.allocator, "\\\\ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
 }
 
 test "Z024: allow line with exactly 120 characters" {
@@ -4983,23 +5304,14 @@ test "Z024: allow line with exactly 120 characters" {
     var linter: Linter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z024) {
-            // Should not find Z024 for exactly 120 characters
-            try std.testing.expect(false);
-        }
-    }
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
 }
 
 test "Z024: allow short line" {
     var linter: Linter = .init(std.testing.allocator, "const x = 1;\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z024) {
-            try std.testing.expect(false);
-        }
-    }
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
 }
 
 test "Z025: detect catch return" {
@@ -5973,6 +6285,22 @@ test "Z030: allow deinit with self.* = undefined at end" {
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
 }
 
+test "Z030: allow heap-owned deinit to poison before destroy" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Foo) void {
+        \\        const allocator = self.allocator;
+        \\        self.* = undefined;
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
 test "Z030: allow deinit with defer self.* = undefined" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Foo = struct {
@@ -6126,6 +6454,13 @@ test "Z032: allow XmlParser" {
 
 test "Z032: allow two-letter at start" {
     var linter: Linter = .init(std.testing.allocator, "const IoError = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: skip underscore-separated names" {
+    var linter: Linter = .init(std.testing.allocator, "const ILLUMINA_ADAPTERS = struct {};", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
