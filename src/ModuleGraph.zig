@@ -28,7 +28,7 @@ pub const Module = struct {
     zir: ?Zir = null,
 };
 
-pub fn init(io: std.Io, allocator: std.mem.Allocator, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
     const root_dir = std.fs.path.dirname(root_source) orelse ".";
 
     var graph: ModuleGraph = .{
@@ -291,7 +291,7 @@ test "parse simple module" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(1, graph.moduleCount());
@@ -308,7 +308,7 @@ test "resolve relative import" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(2, graph.moduleCount());
@@ -324,7 +324,7 @@ test "handle missing import gracefully" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(1, graph.moduleCount());
@@ -345,7 +345,7 @@ test "no duplicate modules" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     // main.zig, other.zig, shared.zig - no duplicates

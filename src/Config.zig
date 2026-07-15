@@ -3,7 +3,9 @@
 
 const std = @import("std");
 
-const Rule = @import("rules.zig").Rule;
+/// Public re-export: `isRuleEnabled`/`setRuleEnabled` take a `Rule`, so the
+/// type must be reachable from this namespace by callers (ziglint Z012).
+pub const Rule = @import("rules.zig").Rule;
 
 const Config = @This();
 
@@ -28,6 +30,15 @@ pub fn isRuleEnabled(self: *const Config, rule: Rule) bool {
     return true;
 }
 
+/// Frees the `paths` entries allocated by `parseConfigSource` and leaves
+/// the config invalidated. Safe to call on a default-initialized `Config`
+/// (the default `paths` slice is empty and never freed).
+pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+    for (self.paths) |p| allocator.free(p);
+    if (self.paths.len > 0) allocator.free(self.paths);
+    self.* = undefined;
+}
+
 /// Set whether a rule is enabled.
 pub fn setRuleEnabled(self: *Config, rule: Rule, enabled: bool) void {
     inline for (@typeInfo(Rule).@"enum".fields) |field| {
@@ -39,20 +50,20 @@ pub fn setRuleEnabled(self: *Config, rule: Rule, enabled: bool) void {
 }
 
 /// Load config from .ziglint.zon file, searching from start_path up to root.
-pub fn load(io: std.Io, allocator: std.mem.Allocator, start_path: ?[]const u8) !Config {
-    const config_path = try findConfigFile(io, allocator, start_path) orelse return .{};
+pub fn load(allocator: std.mem.Allocator, io: std.Io, start_path: ?[]const u8) !Config {
+    const config_path = try findConfigFile(allocator, io, start_path) orelse return .{};
     defer allocator.free(config_path);
 
-    return parseConfigFile(io, allocator, config_path) catch |err| {
+    return parseConfigFile(allocator, io, config_path) catch |err| {
         std.debug.print("warning: failed to parse {s}: {}\n", .{ config_path, err });
         return .{};
     };
 }
 
 /// Find .ziglint.zon by walking up from start_path.
-fn findConfigFile(io: std.Io, allocator: std.mem.Allocator, start_path: ?[]const u8) !?[]const u8 {
+fn findConfigFile(allocator: std.mem.Allocator, io: std.Io, start_path: ?[]const u8) !?[]const u8 {
     const path = start_path orelse {
-        return findConfigInDir(io, allocator, ".");
+        return findConfigInDir(allocator, io, ".");
     };
 
     const abs_path_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch null;
@@ -61,7 +72,7 @@ fn findConfigFile(io: std.Io, allocator: std.mem.Allocator, start_path: ?[]const
 
     var current = abs_path;
     while (true) {
-        if (try findConfigInDir(io, allocator, current)) |config_path| {
+        if (try findConfigInDir(allocator, io, current)) |config_path| {
             return config_path;
         }
 
@@ -73,7 +84,7 @@ fn findConfigFile(io: std.Io, allocator: std.mem.Allocator, start_path: ?[]const
     return null;
 }
 
-fn findConfigInDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
+fn findConfigInDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !?[]const u8 {
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, ".ziglint.zon" });
     errdefer allocator.free(config_path);
 
@@ -91,7 +102,7 @@ const ZonConfig = struct {
     rules: ?Rule.Config = null,
 };
 
-fn parseConfigFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Config {
+fn parseConfigFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
     const source = try std.Io.Dir.cwd().readFileAllocOptions(
         io,
         path,
@@ -194,11 +205,8 @@ test "parse paths config" {
         \\    },
         \\}
     ;
-    const config = try parseConfigSource(std.testing.allocator, source);
-    defer {
-        for (config.paths) |item| std.testing.allocator.free(item);
-        std.testing.allocator.free(config.paths);
-    }
+    var config = try parseConfigSource(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(2, config.paths.len);
     try std.testing.expectEqualStrings("src", config.paths[0]);
     try std.testing.expectEqualStrings("lib", config.paths[1]);

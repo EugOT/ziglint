@@ -36,7 +36,7 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
 
     // Parse frontmatter for rule identifier
     if (std.mem.startsWith(u8, content, "---\n")) {
-        if (std.mem.indexOf(u8, content[4..], "\n---")) |end| {
+        if (std.mem.find(u8, content[4..], "\n---")) |end| {
             const frontmatter = content[4..][0..end];
             var lines = std.mem.splitScalar(u8, frontmatter, '\n');
             while (lines.next()) |line| {
@@ -51,7 +51,7 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
     // Find all zig code blocks
     var line_num: usize = 1;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, content, pos, "```zig\n")) |start| {
+    while (std.mem.findPos(u8, content, pos, "```zig\n")) |start| {
         // Count lines up to this point
         for (content[pos..start]) |c| {
             if (c == '\n') line_num += 1;
@@ -59,14 +59,14 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
         line_num += 1; // for the ```zig line
 
         const code_start = start + 7;
-        if (std.mem.indexOfPos(u8, content, code_start, "\n```")) |end| {
+        if (std.mem.findPos(u8, content, code_start, "\n```")) |end| {
             const code = content[code_start..end];
 
             // Parse expected rules from `// expect: ZXXX` comments
             var expected: std.ArrayList(rules.Rule) = .empty;
             var code_lines = std.mem.splitScalar(u8, code, '\n');
             while (code_lines.next()) |code_line| {
-                if (std.mem.indexOf(u8, code_line, "// expect:")) |expect_pos| {
+                if (std.mem.find(u8, code_line, "// expect:")) |expect_pos| {
                     var expect_str = code_line[expect_pos + 10 ..];
                     expect_str = std.mem.trim(u8, expect_str, " ");
                     // Handle multiple expectations: `// expect: Z001, Z002`
@@ -111,7 +111,7 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
     defer allocator.free(path);
 
     // Try to create ModuleGraph for semantic analysis (may fail for invalid code)
-    var graph: ?ModuleGraph = ModuleGraph.init(io, allocator, path, null) catch null;
+    var graph: ?ModuleGraph = ModuleGraph.init(allocator, io, path, null) catch null;
     defer if (graph) |*g| g.deinit();
 
     var resolver: ?TypeResolver = if (graph) |*g| TypeResolver.init(allocator, g) else null;
@@ -138,19 +138,21 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
         }
     }
 
-    // If no expectations, should have no diagnostics
-    if (doc_test.expected_rules.len == 0) {
-        const total = linter.diagnostics.items.len;
-        if (total > 0) {
-            std.debug.print("\n{s}:{d}: expected no diagnostics but got {d}\n", .{
+    // Reject diagnostics for rules that were not expected. Extra findings
+    // must not ride along silently just because one expectation matched —
+    // and with no expectations at all, any diagnostic is unexpected.
+    for (linter.diagnostics.items) |d| {
+        const expected = for (doc_test.expected_rules) |expected_rule| {
+            if (expected_rule == d.rule) break true;
+        } else false;
+        if (!expected) {
+            std.debug.print("\n{s}:{d}: unexpected {s} diagnostic: {s}\n", .{
                 doc_path,
                 doc_test.line_in_doc,
-                total,
+                d.rule.code(),
+                d.context,
             });
             std.debug.print("Code:\n{s}\n", .{doc_test.code});
-            for (linter.diagnostics.items) |d| {
-                std.debug.print("  - {s}: {s}\n", .{ d.rule.code(), d.context });
-            }
             return error.UnexpectedDiagnostic;
         }
     }
@@ -175,6 +177,7 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
 
     var file_count: usize = 0;
     var test_count: usize = 0;
+    var failure_count: usize = 0;
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
@@ -193,10 +196,24 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
         defer allocator.free(full_path);
 
         for (doc.tests) |doc_test| {
-            try runDocTest(allocator, full_path, doc_test, &tmp_dir);
+            // Run every fixture before failing so one gate run reports all
+            // offending docs instead of stopping at the first. Only the two
+            // assertion errors count as fixture failures; infrastructure
+            // errors (I/O, OOM, ...) propagate immediately.
+            runDocTest(allocator, full_path, doc_test, &tmp_dir) catch |err| switch (err) {
+                error.MissingExpectedDiagnostic,
+                error.UnexpectedDiagnostic,
+                => failure_count += 1,
+                else => return err,
+            };
             test_count += 1;
         }
         file_count += 1;
+    }
+
+    if (failure_count > 0) {
+        std.debug.print("\n{d}/{d} doc tests failed\n", .{ failure_count, test_count });
+        return error.DocTestsFailed;
     }
 }
 

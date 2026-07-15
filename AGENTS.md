@@ -60,10 +60,10 @@ b.addExecutable(.{
 ## Zig Code Style
 
 **Naming:**
-- `camelCase` for functions and methods
-- `snake_case` for variables and parameters
+- `camelCase` for functions and methods (`PascalCase` when returning a type)
+- `snake_case` for variables, parameters, and value constants — Zig stdlib
+  convention (e.g. `std.fs.max_path_bytes`), enforced by Z006
 - `PascalCase` for types, structs, and enums
-- `SCREAMING_SNAKE_CASE` for constants
 
 **Struct initialization:** Prefer explicit type annotation with anonymous literals:
 ```zig
