@@ -23,8 +23,21 @@ pub fn getDocComment(allocator: std.mem.Allocator, tree: *const Ast, node: Ast.N
         if (tag == .doc_comment) {
             doc_tokens.append(allocator, token) catch return null;
         } else {
-            // Stop at non-doc-comment tokens (skip pub keyword)
-            if (tag != .keyword_pub) break;
+            // Stop at non-doc-comment tokens, skipping declaration
+            // qualifiers (`pub inline fn`, `pub extern "c" fn`, ...) that
+            // may sit between the doc comment and the declaration itself.
+            switch (tag) {
+                .keyword_pub,
+                .keyword_inline,
+                .keyword_noinline,
+                .keyword_extern,
+                .keyword_export,
+                .keyword_threadlocal,
+                .keyword_comptime,
+                .string_literal,
+                => {},
+                else => break,
+            }
         }
         if (token == 0) break;
         token -= 1;

@@ -2,28 +2,46 @@ name: CI
 
 on:
   push:
-    branches: ['*']
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
+
+# Keep only the newest validation for a PR or the main branch. This avoids
+# spending hosted-runner time on commits that can no longer be merged.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# No CI job writes to the repository, release, or any external service.
+permissions:
+  contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build-runner]
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          version: 0.15.2
-      - run: zig build test
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+      - name: Format and test
+        run: |
+          zig fmt --check src build.zig
+          zig build test --summary failures --test-timeout 30s
 
   build:
-    runs-on: ubuntu-latest
+    needs: test
+    runs-on: [self-hosted, build-runner]
     strategy:
       matrix:
         target: [aarch64-macos, aarch64-linux, x86_64-linux, x86_64-windows]
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          version: 0.15.2
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
       - run: zig build -Dtarget=${{ matrix.target }}

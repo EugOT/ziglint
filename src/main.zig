@@ -1,7 +1,6 @@
 //! ziglint - A linter for Zig source code
 
 const std = @import("std");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const version = build_options.version;
 
@@ -49,7 +48,7 @@ pub fn main(init: std.process.Init) !u8 {
     const cfg_alloc = config_arena.allocator();
 
     const stderr_file = std.Io.File.stderr();
-    const use_color = detectColorSupport(stderr_file, io, environ_map);
+    const use_color = detectColorSupport(io, stderr_file, environ_map);
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
@@ -65,9 +64,14 @@ pub fn main(init: std.process.Init) !u8 {
         else => return err,
     };
 
-    // Load config file from first CLI path (or current directory)
+    // Load config file from first CLI path (or current directory).
+    // Log before falling back to defaults so config-discovery failures (e.g. an
+    // allocation error while joining the search path) aren't swallowed silently.
     const start_path = if (config.paths.len > 0) config.paths[0] else null;
-    config.file_config = FileConfig.load(io, cfg_alloc, start_path) catch .{};
+    config.file_config = FileConfig.load(cfg_alloc, io, start_path) catch |err| blk: {
+        try stderr.interface.print("warning: failed to load config: {}\n", .{err});
+        break :blk .{};
+    };
 
     applyOnlyRules(&config);
 
@@ -106,7 +110,7 @@ pub fn main(init: std.process.Init) !u8 {
     return if (total_issues > 0) 1 else 0;
 }
 
-fn detectColorSupport(file: std.Io.File, io: std.Io, environ_map: *const std.process.Environ.Map) bool {
+fn detectColorSupport(io: std.Io, file: std.Io.File, environ_map: *const std.process.Environ.Map) bool {
     // NO_COLOR takes precedence (https://no-color.org/)
     if (environ_map.get("NO_COLOR")) |_| return false;
     if (environ_map.get("FORCE_COLOR")) |_| return true;
@@ -261,9 +265,9 @@ fn detectZigLibPath(out_alloc: std.mem.Allocator, tmp_alloc: std.mem.Allocator, 
 
 fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]const u8 {
     const needle = ".lib_dir = \"";
-    const start_idx = std.mem.indexOf(u8, output, needle) orelse return null;
+    const start_idx = std.mem.find(u8, output, needle) orelse return null;
     const value_start = start_idx + needle.len;
-    const end_idx = std.mem.indexOfPos(u8, output, value_start, "\"") orelse return null;
+    const end_idx = std.mem.findPos(u8, output, value_start, "\"") orelse return null;
     return allocator.dupe(u8, output[value_start..end_idx]) catch null;
 }
 
@@ -280,7 +284,13 @@ fn lintPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_
         return lintDirectory(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
     }
 
+    if (!isZigSourcePath(path)) return 0;
+
     return lintFile(allocator, io, path, zig_lib_path, config, use_color, project_root, writer);
+}
+
+fn isZigSourcePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, std.fs.path.basename(path), ".zig");
 }
 
 fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
@@ -290,7 +300,7 @@ fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig
     };
     defer dir.close(io);
 
-    const gitignore = loadGitignore(io, allocator, dir);
+    const gitignore = loadGitignore(allocator, io, dir);
     defer if (gitignore) |g| allocator.free(g);
 
     // Collect all .zig files first
@@ -306,7 +316,13 @@ fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig
     };
     defer walker.deinit();
 
-    while (walker.next(io) catch null) |entry| {
+    while (walker.next(io) catch |err| blk: {
+        // Report instead of silently ending traversal: a permission error or
+        // symlink loop mid-walk would otherwise drop the rest of the tree with
+        // no diagnostic, leaving files un-linted without the user knowing.
+        try writer.print("warning: stopped walking '{s}': {}\n", .{ path, err });
+        break :blk null;
+    }) |entry| {
         if (shouldSkip(entry.path, gitignore)) continue;
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
@@ -332,7 +348,7 @@ fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig
 
     // Build module graph once using first file as root, then add all others
     const graph_start = if (timer) |*t| t.read(io) else 0;
-    var graph = ModuleGraph.init(io, allocator, files.items[0], zig_lib_path) catch {
+    var graph = ModuleGraph.init(allocator, io, files.items[0], zig_lib_path) catch {
         // Fall back to per-file linting without semantics
         if (config.verbose) {
             try writer.print("{s}│ module graph failed, using simple linting{s}\n", .{ dim, reset });
@@ -418,10 +434,10 @@ fn matchesGitignore(path: []const u8, pattern: []const u8) bool {
         if (std.mem.eql(u8, component, clean_pattern)) return true;
     }
 
-    return std.mem.indexOf(u8, path, clean_pattern) != null;
+    return std.mem.find(u8, path, clean_pattern) != null;
 }
 
-fn loadGitignore(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?[]const u8 {
+fn loadGitignore(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ?[]const u8 {
     return dir.readFileAlloc(io, ".gitignore", allocator, .limited(1024 * 64)) catch null;
 }
 
@@ -437,7 +453,7 @@ fn lintFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig_lib_
     }
 
     const graph_start = if (timer) |*t| t.read(io) else 0;
-    var graph = ModuleGraph.init(io, allocator, path, zig_lib_path) catch {
+    var graph = ModuleGraph.init(allocator, io, path, zig_lib_path) catch {
         return lintFileSimple(allocator, io, path, config, use_color, project_root, writer);
     };
     defer graph.deinit();
@@ -637,6 +653,13 @@ test "applyOnlyRules keeps ignore precedence" {
     try std.testing.expect(config.file_config.isRuleEnabled(.Z001));
     try std.testing.expect(!config.file_config.isRuleEnabled(.Z002));
     try std.testing.expect(!config.file_config.isRuleEnabled(.Z003));
+}
+
+test "isZigSourcePath accepts only Zig source files" {
+    try std.testing.expect(isZigSourcePath("src/main.zig"));
+    try std.testing.expect(isZigSourcePath("build.zig"));
+    try std.testing.expect(!isZigSourcePath("build.zig.zon"));
+    try std.testing.expect(!isZigSourcePath("README.md"));
 }
 
 /// Test-only Io provider matching the convention used by ModuleGraph/TypeResolver.

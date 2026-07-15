@@ -2,7 +2,7 @@
     .name = .ziglint,
     .version = "0.5.2",
     .fingerprint = 0x4b7deecc2ff046b7,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -28,10 +28,10 @@ const Linter = @This();
 /// in Linter is diagnostic-only (perf debug), so we degrade reads to 0 here and
 /// leave the wider Io plumbing for a follow-up refactor.
 const Timer = struct {
-    pub fn start() error{}!Timer {
+    fn start() error{}!Timer {
         return .{};
     }
-    pub fn read(_: *Timer) u64 {
+    fn read(_: *Timer) u64 {
         return 0;
     }
 };
@@ -374,7 +374,7 @@ fn buildParentMap(self: *Linter) void {
 }
 
 const ChildList = struct {
-    items: [8]Ast.Node.Index = undefined,
+    items: [32]Ast.Node.Index = undefined,
     len: usize = 0,
 
     fn append(self: *ChildList, item: Ast.Node.Index) void {
@@ -525,6 +525,22 @@ fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
             const data = self.tree.nodeData(node).node_and_node;
             children.append(data[0]); // The expression being caught
             children.append(data[1]); // The catch body
+        },
+
+        .@"switch", .switch_comma => {
+            const full_switch = self.tree.fullSwitch(node) orelse return children;
+            children.append(full_switch.ast.condition);
+            for (full_switch.ast.cases) |case| children.append(case);
+        },
+
+        .switch_case_one,
+        .switch_case_inline_one,
+        .switch_case,
+        .switch_case_inline,
+        => {
+            const case = self.tree.fullSwitchCase(node) orelse return children;
+            for (case.ast.values) |value| children.append(value);
+            children.append(case.ast.target_expr);
         },
 
         else => {},
@@ -905,14 +921,16 @@ fn buildPublicTypesMap(self: *Linter) void {
 fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
 
-    // Use type resolver if available
+    // Use type resolver if available. An unresolved semantic query must not
+    // suppress the syntactic fallback below; module aliases such as
+    // `const StorageError = mod.StorageError` are often public imported API.
     if (self.type_resolver) |resolver| {
         if (self.module_path) |mod_path| {
             const type_info = resolver.typeOf(mod_path, init_node);
-            return switch (type_info) {
-                .type_type, .std_type, .user_type => true,
-                else => false,
-            };
+            switch (type_info) {
+                .type_type, .std_type, .user_type => return true,
+                else => {},
+            }
         }
     }
 
@@ -972,6 +990,8 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
         => true,
         // Error union types (e.g., E!T)
         .error_union => true,
+        // Composed error sets (e.g., error{A} || std.mem.Allocator.Error)
+        .merge_error_sets => true,
         // Error set declarations (e.g., error{A, B})
         .error_set_decl => true,
         // Function types
@@ -983,7 +1003,7 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
         // Builtin type constructors
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(node));
-            break :blk std.mem.eql(u8, token, "@Type");
+            break :blk isBuiltinTypeConstructor(token);
         },
         // Identifier referencing another type (type alias)
         .identifier => blk: {
@@ -1013,11 +1033,29 @@ fn isPrivateTypeRef(self: *Linter, name: []const u8, enclosing_container: Ast.No
     if (isBuiltinType(name)) return false;
     if (self.public_types.contains(name)) return false;
     if (self.imported_types.contains(name)) return false;
+    if (std.mem.eql(u8, name, "Self") and enclosing_container.unwrap() != null) return false;
+    if (self.enclosingContainerName(enclosing_container)) |container_name| {
+        if (std.mem.eql(u8, name, container_name)) return false;
+    }
     // Don't flag Self type (type matching filename for file-as-struct pattern)
     if (self.isSelfType(name)) return false;
     // Check if type is pub within the enclosing container
     if (self.isPublicInContainer(name, enclosing_container)) return false;
     return true;
+}
+
+fn enclosingContainerName(self: *Linter, container_opt: Ast.Node.OptionalIndex) ?[]const u8 {
+    const container = container_opt.unwrap() orelse return null;
+    if (self.parent_map.len == 0) return null;
+    const parent = self.parent_map[@intFromEnum(container)].unwrap() orelse return null;
+    return switch (self.tree.nodeTag(parent)) {
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => blk: {
+            const var_decl = self.tree.fullVarDecl(parent) orelse break :blk null;
+            const name_token = var_decl.ast.mut_token + 1;
+            break :blk self.tree.tokenSlice(name_token);
+        },
+        else => null,
+    };
 }
 
 /// Check if a type name is declared as `pub const` within the given container
@@ -1074,6 +1112,38 @@ fn isBuiltinType(name: []const u8) bool {
         "f16",          "f32",            "f64",  "f80",      "f128",    "bool",
         "void",         "noreturn",       "type", "anyerror", "anytype", "anyframe",
         "comptime_int", "comptime_float",
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+fn isBuiltinTypeConstructor(name: []const u8) bool {
+    const builtins = [_][]const u8{
+        "@This",
+        "@import",
+        "@Type",
+        "@TypeOf",
+        "@Int",
+        "@Float",
+        "@Pointer",
+        "@Array",
+        "@Vector",
+        "@Optional",
+        "@ErrorUnion",
+        "@ErrorSet",
+        "@Enum",
+        // @EnumLiteral() type and @Tuple(comptime field_types: []const type) type
+        // are documented Zig 0.16 type-constructor builtins (langref §@EnumLiteral,
+        // §@Tuple). They return `type`, so they belong in this list.
+        "@EnumLiteral",
+        "@Union",
+        "@Struct",
+        "@Opaque",
+        "@Fn",
+        "@Frame",
+        "@Tuple",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
@@ -1552,7 +1622,7 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
             const loc = self.tree.tokenLocation(0, name_token);
             self.report(loc, .Z005, name);
         }
-    } else {
+    } else if (!self.isExportedFunction(fn_proto)) {
         if (!isValidFunctionName(name)) {
             const loc = self.tree.tokenLocation(0, name_token);
             self.report(loc, .Z001, name);
@@ -1604,6 +1674,11 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
     self.checkDeinitUndefined(node, fn_proto);
 }
 
+fn isExportedFunction(self: *Linter, fn_proto: Ast.full.FnProto) bool {
+    const token = fn_proto.extern_export_inline_token orelse return false;
+    return self.tree.tokenTag(token) == .keyword_export;
+}
+
 fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.FnProto) void {
     if (!self.config.isRuleEnabled(.Z030)) return;
 
@@ -1636,6 +1711,7 @@ fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.
 
     // Check if last statement is `self.* = undefined;`
     if (self.lastStatementIsSelfUndefined(body_node, param_name)) return;
+    if (self.lastStatementsAreSelfUndefinedThenDestroy(body_node, param_name)) return;
 
     // None of the valid patterns found
     const loc = self.tree.tokenLocation(0, name_token);
@@ -1709,6 +1785,23 @@ fn lastStatementIsSelfUndefined(self: *Linter, body_node: Ast.Node.Index, param_
 
     const last_stmt = stmts[stmts.len - 1];
     return self.isSelfUndefinedAssign(last_stmt, param_name);
+}
+
+fn lastStatementsAreSelfUndefinedThenDestroy(self: *Linter, body_node: Ast.Node.Index, param_name: []const u8) bool {
+    var buf: [2]Ast.Node.Index = undefined;
+    const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
+    if (stmts.len < 2) return false;
+
+    const poison_stmt = stmts[stmts.len - 2];
+    const destroy_stmt = stmts[stmts.len - 1];
+    return self.isSelfUndefinedAssign(poison_stmt, param_name) and self.isDestroySelfCall(destroy_stmt, param_name);
+}
+
+fn isDestroySelfCall(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
+    const source = self.getNodeSource(node);
+    if (std.mem.indexOf(u8, source, ".destroy(") == null) return false;
+    if (std.mem.indexOf(u8, source, param_name) == null) return false;
+    return true;
 }
 
 fn isSelfUndefinedAssign(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
@@ -1878,7 +1971,7 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
 
 fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
-    self.checkRedundantType(return_expr, true);
+    self.checkRedundantType(return_expr, self.returnFieldAccessMatchesReturnType(return_expr), false);
 
     if (self.rule_timer) |*t| {
         const start = t.read();
@@ -1889,6 +1982,19 @@ fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     }
 
     self.checkRedundantAsInReturn(node, return_expr);
+}
+
+fn returnFieldAccessMatchesReturnType(self: *Linter, return_expr: Ast.Node.Index) bool {
+    if (self.tree.nodeTag(return_expr) != .field_access) return false;
+
+    const data = self.tree.nodeData(return_expr).node_and_token;
+    const lhs = data[0];
+    if (self.tree.nodeTag(lhs) != .identifier) return false;
+    const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
+
+    const fn_return_type = self.current_fn_return_type.unwrap() orelse return false;
+    const fn_return_name = self.getTypeNodeName(fn_return_type) orelse return false;
+    return std.mem.eql(u8, lhs_name, fn_return_name);
 }
 
 fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
@@ -2045,6 +2151,36 @@ fn getAsTypeName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
     return self.getTypeNodeName(params[0]);
 }
 
+/// Source text of an `@as(T, ...)` cast's type node, for comparison against a
+/// field's declared type. Unlike getAsTypeName this also covers composite types
+/// (`*u32`, `?T`, `[N]T`, `a.b.C`); pair it with typeTextEql for whitespace-
+/// insensitive comparison so Z029 detects redundant casts on all field types.
+fn getAsTypeText(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(node);
+    if (tag != .builtin_call_two and tag != .builtin_call_two_comma and
+        tag != .builtin_call and tag != .builtin_call_comma) return null;
+    if (!std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(node)), "@as")) return null;
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = self.tree.builtinCallParams(&buf, node) orelse return null;
+    if (params.len < 1) return null;
+    return self.tree.getNodeSource(params[0]);
+}
+
+/// Whitespace-insensitive equality of two type source strings, so `[3]u8` and
+/// `[3] u8` (or differently-spaced field/cast types) compare equal.
+fn typeTextEql(a: []const u8, b: []const u8) bool {
+    var ia: usize = 0;
+    var ib: usize = 0;
+    while (true) {
+        while (ia < a.len and std.ascii.isWhitespace(a[ia])) ia += 1;
+        while (ib < b.len and std.ascii.isWhitespace(b[ib])) ib += 1;
+        if (ia >= a.len or ib >= b.len) return ia >= a.len and ib >= b.len;
+        if (a[ia] != b[ib]) return false;
+        ia += 1;
+        ib += 1;
+    }
+}
+
 fn getTypeNodeName(self: *Linter, type_node: Ast.Node.Index) ?[]const u8 {
     const tag = self.tree.nodeTag(type_node);
     return switch (tag) {
@@ -2171,7 +2307,7 @@ fn checkRedundantAsInStructInit(self: *Linter, node: Ast.Node.Index) void {
     const struct_type_name = self.resolveStructInitTypeName(node, struct_init) orelse return;
 
     for (struct_init.ast.fields) |field_value| {
-        const as_type_name = self.getAsTypeName(field_value) orelse continue;
+        const as_type_text = self.getAsTypeText(field_value) orelse continue;
 
         // Get field name: token before '=' before the value expression
         const value_main_token = self.tree.nodeMainToken(field_value);
@@ -2180,10 +2316,10 @@ fn checkRedundantAsInStructInit(self: *Linter, node: Ast.Node.Index) void {
         if (self.tree.tokenTag(field_name_token) != .identifier) continue;
         const field_name = self.tree.tokenSlice(field_name_token);
 
-        const field_type_name = self.findContainerFieldType(struct_type_name, field_name) orelse continue;
-        if (std.mem.eql(u8, as_type_name, field_type_name)) {
+        const field_type_text = self.findContainerFieldType(struct_type_name, field_name) orelse continue;
+        if (typeTextEql(as_type_text, field_type_text)) {
             const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(field_value));
-            self.report(loc, .Z029, as_type_name);
+            self.report(loc, .Z029, as_type_text);
         }
     }
 }
@@ -2229,11 +2365,11 @@ fn findContainerFieldTypeInTree(self: *Linter, tree: *const Ast, struct_type_nam
                     const field = tree.fullContainerField(member) orelse continue;
                     if (!std.mem.eql(u8, tree.tokenSlice(field.ast.main_token), field_name)) continue;
                     const type_node = field.ast.type_expr.unwrap() orelse return null;
-                    const field_type_tag = tree.nodeTag(type_node);
-                    return switch (field_type_tag) {
-                        .identifier => tree.tokenSlice(tree.nodeMainToken(type_node)),
-                        else => null,
-                    };
+                    // Return the field type's raw source text. Comparison in
+                    // checkRedundantAsInStructInit normalizes whitespace, so this
+                    // handles composite types (`*u32`, `?T`, `[N]T`, `a.b.C`) too,
+                    // not just bare identifiers (Z029 false negatives otherwise).
+                    return tree.getNodeSource(type_node);
                 }
             },
             else => {},
@@ -2247,7 +2383,7 @@ fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
     const call = self.tree.fullCall(&buf, node) orelse return;
     for (call.ast.params) |arg| {
         // Don't check field_access in call args - can't distinguish type params from enum values
-        self.checkRedundantType(arg, false);
+        self.checkRedundantType(arg, false, true);
     }
 }
 
@@ -2391,20 +2527,21 @@ fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
     self.report(loc, .Z016, "and");
 }
 
-fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
+fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool, in_call_arg: bool) void {
     const tag = self.tree.nodeTag(node);
 
     if (isExplicitStructInit(tag)) {
         var buf: [2]Ast.Node.Index = undefined;
         const struct_init = self.tree.fullStructInit(&buf, node) orelse return;
         const type_node = struct_init.ast.type_expr.unwrap() orelse return;
+        if (in_call_arg and self.typeDeclHasCallableMembers(type_node)) return;
         const type_token = self.tree.nodeMainToken(type_node);
         const loc = self.tree.tokenLocation(0, type_token);
         // Get the fields part (everything after the type name)
         const full_expr = self.getNodeSource(node);
         const type_name = self.tree.tokenSlice(type_token);
         // Find where the type name ends and extract the { ... } part
-        const brace_start = std.mem.indexOf(u8, full_expr, "{") orelse return;
+        const brace_start = std.mem.find(u8, full_expr, "{") orelse return;
         const fields_part = truncateExpr(full_expr[brace_start..]);
         const full_truncated = truncateExpr(full_expr);
         const msg = std.fmt.allocPrint(self.allocator, ".{s}\x00{s}", .{ fields_part, full_truncated }) catch return;
@@ -2457,7 +2594,7 @@ fn truncateExpr(expr: []const u8) []const u8 {
     const max_len = 32;
     if (expr.len <= max_len) return expr;
     // Find a good break point (after opening brace if present)
-    if (std.mem.indexOf(u8, expr[0..@min(max_len, expr.len)], "{")) |brace| {
+    if (std.mem.find(u8, expr[0..@min(max_len, expr.len)], "{")) |brace| {
         return expr[0 .. brace + 1];
     }
     return expr[0..max_len];
@@ -2472,6 +2609,33 @@ fn isExplicitStructInit(tag: Ast.Node.Tag) bool {
         => true,
         else => false,
     };
+}
+
+fn typeDeclHasCallableMembers(self: *Linter, type_node: Ast.Node.Index) bool {
+    const type_name = self.getTypeNodeName(type_node) orelse return false;
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(node);
+        switch (tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = self.tree.fullVarDecl(node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                const decl_name = self.tree.tokenSlice(name_token);
+                if (!std.mem.eql(u8, decl_name, type_name)) continue;
+
+                const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+                if (!self.isTypeExpression(init_node)) continue;
+                const members = self.getContainerMembers(init_node) orelse continue;
+                for (members) |member| {
+                    if (self.tree.nodeTag(member) == .fn_decl) return true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    return false;
 }
 
 fn isValidFunctionName(name: []const u8) bool {
@@ -2520,6 +2684,7 @@ fn hasUnderscorePrefix(name: []const u8) bool {
 /// Returns the suggested fix if there's an issue, null otherwise.
 fn checkAcronymCasing(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     if (name.len < 2) return null;
+    if (std.mem.indexOfScalar(u8, name, '_') != null) return null;
 
     // Find sequences of 2+ uppercase letters that should be title-cased
     // XMLParser -> XmlParser (XML at start)
@@ -2691,10 +2856,7 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
-            break :blk std.mem.eql(u8, token, "@This") or
-                std.mem.eql(u8, token, "@import") or
-                std.mem.eql(u8, token, "@Type") or
-                std.mem.eql(u8, token, "@TypeOf");
+            break :blk isBuiltinTypeConstructor(token);
         },
         .call_one, .call_one_comma => blk: {
             // Check if calling a PascalCase function (type constructor)
@@ -2819,9 +2981,9 @@ fn isIgnored(self: *Linter, line: usize, rule: rules.Rule) bool {
 }
 
 fn lineHasIgnore(_: *Linter, line_text: []const u8, rule: rules.Rule) bool {
-    if (std.mem.indexOf(u8, line_text, "// ziglint-ignore:")) |idx| {
+    if (std.mem.find(u8, line_text, "// ziglint-ignore:")) |idx| {
         const ignore_part = line_text[idx + 18 ..];
-        if (std.mem.indexOf(u8, ignore_part, rule.code()) != null) return true;
+        if (std.mem.find(u8, ignore_part, rule.code()) != null) return true;
     }
     return false;
 }
@@ -2852,8 +3014,9 @@ fn checkLineLength(self: *Linter) void {
 
     for (self.source, 0..) |c, i| {
         if (c == '\n') {
-            const line_len = i - line_start;
-            if (line_len > max_len) {
+            const line = self.source[line_start..i];
+            const line_len = line.len;
+            if (line_len > max_len and !shouldSkipLineLength(line)) {
                 // Format: "actual_len\x00max_len" for the error message
                 const context = std.fmt.allocPrint(self.allocator, "{}\x00{}", .{ line_len, max_len }) catch continue;
                 self.allocated_contexts.append(self.allocator, context) catch {
@@ -2869,8 +3032,9 @@ fn checkLineLength(self: *Linter) void {
 
     // Check last line if not terminated with newline
     if (line_start < self.source.len) {
-        const line_len = self.source.len - line_start;
-        if (line_len > max_len) {
+        const line = self.source[line_start..];
+        const line_len = line.len;
+        if (line_len > max_len and !shouldSkipLineLength(line)) {
             const context = std.fmt.allocPrint(self.allocator, "{}\x00{}", .{ line_len, max_len }) catch return;
             self.allocated_contexts.append(self.allocator, context) catch {
                 self.allocator.free(context);
@@ -2879,6 +3043,29 @@ fn checkLineLength(self: *Linter) void {
             self.reportLineLength(line_num, context, max_len);
         }
     }
+}
+
+fn shouldSkipLineLength(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    return std.mem.startsWith(u8, trimmed, "//") or
+        std.mem.startsWith(u8, trimmed, "\\\\") or
+        hasStringLiteral(line);
+}
+
+fn hasStringLiteral(line: []const u8) bool {
+    var escaped = false;
+    for (line) |c| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') return true;
+    }
+    return false;
 }
 
 fn reportLineLength(self: *Linter, line: usize, context: []const u8, max_len: u32) void {
@@ -2934,6 +3121,20 @@ test "Z001: detect snake_case function" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: allow exported ABI snake_case function" {
+    var linter: Linter = .init(std.testing.allocator, "export fn my_func() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
+}
+
+test "Z001: allow public exported ABI snake_case function" {
+    var linter: Linter = .init(std.testing.allocator, "pub export fn my_func() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
 }
 
 test "Z001: allow underscore prefix (private)" {
@@ -3099,8 +3300,8 @@ test "Z006: allow type alias with @import()" {
     }
 }
 
-test "Z006: allow type alias with @Type()" {
-    var linter: Linter = .init(std.testing.allocator, "const MyType = @Type(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });", "test.zig", null);
+test "Z006: allow type alias with @Int()" {
+    var linter: Linter = .init(std.testing.allocator, "const MyType = @Int(.unsigned, 8);", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
@@ -3181,12 +3382,10 @@ test "Z006: allow type alias with primitive type" {
 test "Z006: allow PascalCase labeled block type alias" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Config = blk: {
-        \\    break :blk @Type(.{ .@"struct" = .{
-        \\        .layout = .auto,
-        \\        .fields = &.{},
-        \\        .decls = &.{},
-        \\        .is_tuple = false,
-        \\    } });
+        \\    const field_names = [_][]const u8{};
+        \\    const field_types = [_]type{};
+        \\    const field_attrs = [_]std.builtin.Type.StructField.Attributes{};
+        \\    break :blk @Struct(.auto, null, &field_names, &field_types, &field_attrs);
         \\};
     , "test.zig", null);
     defer linter.deinit();
@@ -3480,11 +3679,40 @@ test "Z010: allow anonymous struct in function arg" {
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
 }
 
+test "Z010: allow explicit method context struct in call arg" {
+    const source =
+        \\fn sort(_: anytype) void {}
+        \\fn foo() void {
+        \\    const SortCtx = struct {
+        \\        pub fn lessThan(_: @This(), _: usize, _: usize) bool {
+        \\            return false;
+        \\        }
+        \\        pub fn swap(_: @This(), _: usize, _: usize) void {}
+        \\    };
+        \\    sort(SortCtx{});
+        \\}
+    ;
+    var linter: Linter = .init(std.testing.allocator, source, "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
 test "Z010: detect explicit enum in return" {
     var linter: Linter = .init(std.testing.allocator, "fn foo() Mode { return Mode.fast; }", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow type field access when return type differs" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const TestHooks = struct { pub var next_code: u8 = 0; };
+        \\fn foo() u8 { return TestHooks.next_code; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
 }
 
 test "Z010: allow anonymous enum in return" {
@@ -3526,7 +3754,7 @@ test "Z011: detect deprecated method call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3570,7 +3798,7 @@ test "Z011: no warning for non-deprecated method" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3624,7 +3852,7 @@ test "Z011: detect deprecated direct function call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3663,7 +3891,7 @@ test "Z011: detect deprecated function alias" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3703,7 +3931,7 @@ test "Z011: detect deprecated type function" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3744,7 +3972,7 @@ test "Z011: detect deprecated type function alias" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3783,9 +4011,9 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
+        const start_idx = std.mem.find(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        const end_idx = std.mem.findPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
         break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
@@ -3807,7 +4035,7 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, zig_lib_path);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, zig_lib_path);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3846,9 +4074,9 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
+        const start_idx = std.mem.find(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        const end_idx = std.mem.findPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
         break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
@@ -3999,7 +4227,7 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
         const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
         defer std.testing.allocator.free(path);
 
-        var graph = try ModuleGraph.init(io, std.testing.allocator, path, zig_lib_path);
+        var graph = try ModuleGraph.init(std.testing.allocator, io, path, zig_lib_path);
         defer graph.deinit();
 
         var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4139,6 +4367,68 @@ test "Z012: pub fn using non-pub type from enclosing struct is error" {
     try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
 }
 
+test "Z012: container Self alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const Self = Foo;
+        \\    pub fn init() Self { return .{}; }
+        \\    pub fn update(self: *Self) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: own container name in method signature is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub fn init() Foo { return .{}; }
+        \\    pub fn update(self: *Foo) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: own enum name in method signature is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Report = struct {
+        \\    pub const Status = enum {
+        \\        success,
+        \\        failure,
+        \\        pub fn toString(self: Status) []const u8 {
+        \\            return switch (self) {
+        \\                .success => "success",
+        \\                .failure => "failure",
+        \\            };
+        \\        }
+        \\    };
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: root Self alias remains private" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Self = struct {};
+        \\pub fn init() Self { return .{}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
 test "Z012: pub fn returning builtin type is ok" {
     var linter: Linter = .init(std.testing.allocator,
         \\pub fn getValue() u32 { return 42; }
@@ -4245,6 +4535,48 @@ test "Z012: pub fn returning public error set is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z012);
     }
+}
+
+test "Z015: pub fn returning public composed error set is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const MyError = error{ InvalidInput } || std.mem.Allocator.Error;
+        \\pub fn parse() MyError!void { return {}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z015);
+    }
+}
+
+test "Z012/Z015: private aliases to imported public types are ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const storage = @import("storage.zig");
+        \\const PipelineRun = storage.PipelineRun;
+        \\const StorageError = storage.StorageError;
+        \\pub fn getRun() StorageError!PipelineRun {
+        \\    return undefined;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+        try std.testing.expect(d.rule != rules.Rule.Z015);
+    }
+}
+
+test "Z012: private identifier alias remains private" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\const Alias = Private;
+        \\pub fn getAlias() Alias { return .{}; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
 }
 
 test "Z012: pub fn returning public if expression type is ok" {
@@ -4498,6 +4830,31 @@ test "Z019: @This() in local struct inside nested if blocks is ok" {
     }
 }
 
+test "Z019: @This() in local struct inside switch arm is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(mode: enum { sparse, dense }) void {
+        \\    switch (mode) {
+        \\        .sparse => {
+        \\            const Event = struct {
+        \\                const Self = @This();
+        \\                pub fn lessThan(_: void, a: Self, b: Self) bool {
+        \\                    return a.pos < b.pos;
+        \\                }
+        \\                pos: u64,
+        \\            };
+        \\            _ = Event;
+        \\        },
+        \\        .dense => {},
+        \\    }
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
 test "Z020: inline @This() should warn" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Foo = struct {
@@ -4683,7 +5040,7 @@ test "Z023: argument order - aliased Allocator" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4717,7 +5074,7 @@ test "Z023: argument order - aliased Io" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4785,7 +5142,7 @@ test "Z023: receiver param with struct name is ok (semantic)" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4817,7 +5174,7 @@ test "Z023: file-as-struct receiver is ok (semantic)" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "Terminal.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4909,16 +5266,37 @@ test "Z023: comptime value before other is bad" {
     try std.testing.expect(found);
 }
 
-test "Z024: detect line exceeding 120 characters" {
-    // Line with 121 characters (11 + 108 + 2)
+test "Z024: detect code line exceeding 120 characters" {
+    var linter: Linter = .init(
+        std.testing.allocator,
+        "const very_long_code_line_that_should_still_be_wrapped_by_the_author = @as(u64, 1) + @as(u64, 2) + @as(u64, 3) + @as(u64, 4);\n",
+        "test.zig",
+        null,
+    );
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z024));
+}
+
+test "Z024: allow long string literal line" {
     var linter: Linter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    var found = false;
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z024) found = true;
-    }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
+}
+
+test "Z024: allow long comment line" {
+    var linter: Linter = .init(std.testing.allocator, "// aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
+}
+
+test "Z024: allow long raw string line" {
+    var linter: Linter = .init(std.testing.allocator, "\\\\ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
 }
 
 test "Z024: allow line with exactly 120 characters" {
@@ -4926,23 +5304,14 @@ test "Z024: allow line with exactly 120 characters" {
     var linter: Linter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z024) {
-            // Should not find Z024 for exactly 120 characters
-            try std.testing.expect(false);
-        }
-    }
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
 }
 
 test "Z024: allow short line" {
     var linter: Linter = .init(std.testing.allocator, "const x = 1;\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z024) {
-            try std.testing.expect(false);
-        }
-    }
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
 }
 
 test "Z025: detect catch return" {
@@ -5188,7 +5557,7 @@ test "Z027: flag instance accessing const" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5229,7 +5598,7 @@ test "Z027: flag instance accessing static fn" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5272,7 +5641,7 @@ test "Z027: allow instance method call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5309,7 +5678,7 @@ test "Z027: allow field access" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5346,7 +5715,7 @@ test "Z027: allow type-level access" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5406,7 +5775,7 @@ test "Z027: allow method with Self receiver" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5446,7 +5815,7 @@ test "Z027: allow method with named type receiver" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5538,7 +5907,7 @@ test "Z029: detect redundant @as in method call arg" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -5581,6 +5950,68 @@ test "Z029: detect redundant @as in struct field init" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as for pointer-typed struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    p: *u32,
+        \\};
+        \\pub fn main() void {
+        \\    var n: u32 = 0;
+        \\    const f: Foo = .{ .p = @as(*u32, &n) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as for optional-typed struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    o: ?u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .o = @as(?u32, 42) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as for array-typed struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: [3]u8,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .a = @as([3]u8, .{ 1, 2, 3 }) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different pointer type in struct field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    p: *u32,
+        \\};
+        \\pub fn main() void {
+        \\    var n: u16 = 0;
+        \\    const f: Foo = .{ .p = @as(*u16, &n) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
 }
 
 test "Z029: allow @as with different type in struct field init" {
@@ -5854,6 +6285,22 @@ test "Z030: allow deinit with self.* = undefined at end" {
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
 }
 
+test "Z030: allow heap-owned deinit to poison before destroy" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    allocator: std.mem.Allocator,
+        \\    fn deinit(self: *Foo) void {
+        \\        const allocator = self.allocator;
+        \\        self.* = undefined;
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
 test "Z030: allow deinit with defer self.* = undefined" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Foo = struct {
@@ -6007,6 +6454,13 @@ test "Z032: allow XmlParser" {
 
 test "Z032: allow two-letter at start" {
     var linter: Linter = .init(std.testing.allocator, "const IoError = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: skip underscore-separated names" {
+    var linter: Linter = .init(std.testing.allocator, "const ILLUMINA_ADAPTERS = struct {};", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
