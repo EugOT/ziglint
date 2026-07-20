@@ -41,7 +41,7 @@ Directories are scanned recursively for `.zig` files.
 | Z017 | Avoid `try` directly in return expressions |
 | Z018 | Redundant `@as` when type is already known from context |
 | Z019 | `@This()` in named struct; use the type name instead |
-| Z020 | Inline `@This()`; assign to a constant first |
+| Z020 | Inline `@This()`; use the named type or a `Self` alias |
 | Z021 | File-struct `@This()` alias should match filename or be `Self` |
 | Z022 | `@This()` alias in anonymous/local struct should be `Self` |
 | Z023 | Parameter order: comptime before runtime, pointers before values |
