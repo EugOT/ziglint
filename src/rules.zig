@@ -164,7 +164,7 @@ pub const Rule = enum(u16) {
                 const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
                 const alias = context[0..sep];
                 const expected = if (sep < context.len) context[sep + 1 ..] else context;
-                try writer.print("{s}@This(){s} alias {s}'{s}'{s} should match filename {s}'{s}'{s}", .{ b, r, y, alias, r, y, expected, r });
+                try writer.print("{s}@This(){s} alias {s}'{s}'{s} should match filename {s}'{s}'{s} or be {s}'Self'{s}", .{ b, r, y, alias, r, y, expected, r, y, r });
             },
             // @This() alias in anonymous/local struct should be Self
             .Z022 => {
@@ -405,4 +405,16 @@ test "Z020 recommends Self for an anonymous struct" {
     try Rule.Z020.writeMessage(&output.writer, "", false);
 
     try std.testing.expectEqualStrings("inline @This(); assign it to `const Self = @This();`", output.written());
+}
+
+test "Z021 includes both accepted aliases" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z021.writeMessage(&output.writer, "Wrong\x00Config", false);
+
+    try std.testing.expectEqualStrings(
+        "@This() alias 'Wrong' should match filename 'Config' or be 'Self'",
+        output.written(),
+    );
 }
