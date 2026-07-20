@@ -15,6 +15,7 @@ const rules = @import("rules.zig");
 const DocTest = struct {
     code: []const u8,
     expected_rules: []const rules.Rule,
+    compile_probe: ?[]const u8,
     line_in_doc: usize,
 };
 
@@ -74,9 +75,18 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
                 }
             }
 
+            const after_block = content[end + 4 ..];
+            const probe_prefix = "\n<!-- compile-test: ";
+            const compile_probe = if (std.mem.startsWith(u8, after_block, probe_prefix)) probe: {
+                const probe_start = probe_prefix.len;
+                const probe_end = std.mem.find(u8, after_block[probe_start..], " -->") orelse break :probe null;
+                break :probe after_block[probe_start..][0..probe_end];
+            } else null;
+
             try tests.append(allocator, .{
                 .code = code,
                 .expected_rules = try expected.toOwnedSlice(allocator),
+                .compile_probe = compile_probe,
                 .line_in_doc = line_num,
             });
 
@@ -147,6 +157,43 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
             return error.UnexpectedDiagnostic;
         }
     }
+
+    if (doc_test.compile_probe) |probe| {
+        const compile_source = try std.fmt.allocPrint(allocator,
+            \\{s}
+            \\
+            \\comptime {{
+            \\    {s}
+            \\}}
+        , .{ doc_test.code, probe });
+        defer allocator.free(compile_source);
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "doc_test.zig", .data = compile_source });
+
+        try tmp_dir.dir.createDirPath(std.testing.io, "zig-cache");
+        const cache_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "zig-cache", allocator);
+        defer allocator.free(cache_path);
+
+        const result = try std.process.run(allocator, std.testing.io, .{
+            .argv = &.{ "zig", "test", path, "--cache-dir", cache_path },
+            .stderr_limit = .limited(1024 * 1024),
+            .stdout_limit = .limited(1024 * 1024),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        const compiled = switch (result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!compiled) {
+            std.debug.print("\n{s}:{d}: documented replacement does not compile\n", .{
+                doc_path,
+                doc_test.line_in_doc,
+            });
+            std.debug.print("Compiler output:\n{s}{s}\n", .{ result.stdout, result.stderr });
+            return error.DocumentedReplacementDoesNotCompile;
+        }
+    }
 }
 
 pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
@@ -190,6 +237,22 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
         }
         file_count += 1;
     }
+}
+
+test "parse compile test probe" {
+    const doc = try parseMarkdown(std.testing.allocator,
+        \\```zig
+        \\fn example() void {}
+        \\```
+        \\<!-- compile-test: example(); -->
+    );
+    defer {
+        for (doc.tests) |doc_test| std.testing.allocator.free(doc_test.expected_rules);
+        std.testing.allocator.free(doc.tests);
+    }
+
+    try std.testing.expectEqual(1, doc.tests.len);
+    try std.testing.expectEqualStrings("example();", doc.tests[0].compile_probe.?);
 }
 
 test "doc tests" {
