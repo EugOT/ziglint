@@ -1768,8 +1768,17 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
     if (var_decl.ast.type_node == .none) {
         if (var_decl.ast.init_node.unwrap()) |init_node| {
             if (isExplicitStructInit(self.tree.nodeTag(init_node))) {
+                var buf: [2]Ast.Node.Index = undefined;
+                const struct_init = self.tree.fullStructInit(&buf, init_node) orelse return;
+                const type_node = struct_init.ast.type_expr.unwrap() orelse return;
+                const type_source = self.getNodeSource(type_node);
+                const context = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ name, type_source }) catch return;
+                self.allocated_contexts.append(self.allocator, context) catch {
+                    self.allocator.free(context);
+                    return;
+                };
                 const loc = self.tree.tokenLocation(0, var_decl.ast.mut_token);
-                self.report(loc, .Z004, name);
+                self.report(loc, .Z004, context);
             }
         }
     }
@@ -3010,6 +3019,17 @@ test "Z004: detect explicit struct init with fields" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z004));
+}
+
+test "Z004: diagnostic includes declaration name and actual type" {
+    var linter: Linter = .init(std.testing.allocator, "const Foo = struct {}; fn bar() void { var item = Foo{}; _ = &item; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |diagnostic| {
+        if (diagnostic.rule == .Z004) {
+            try std.testing.expectEqualStrings("item\x00Foo", diagnostic.context);
+        }
+    }
 }
 
 test "Z004: allow anonymous struct init with type annotation" {

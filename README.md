@@ -26,7 +26,7 @@ Directories are scanned recursively for `.zig` files.
 | Z001 | Function names should be camelCase |
 | Z002 | Avoid initialized variables that look like named discards |
 | Z003 | Parse error with parser explanation |
-| Z004 | Prefer `const x: T = .{}` over `const x = T{}` |
+| Z004 | Prefer type annotations with anonymous struct initializers |
 | Z005 | Type function names should be PascalCase |
 | Z006 | Variable names should be snake_case |
 | Z007 | Duplicate import |

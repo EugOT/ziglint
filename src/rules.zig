@@ -95,9 +95,14 @@ pub const Rule = enum(u16) {
                 try writer.writeAll("parse error");
                 if (context.len > 0) try writer.print(": {s}", .{context});
             },
-            // syntax highlight: `const name: T = .{};` vs `const name = T{};`
-            // const=purple (keyword), name=yellow (identifier), T=magenta (type)
-            .Z004 => try writer.print("prefer {s}`{s}{s}const{s} {s}{s}:{s} {s}T{s} = .{{}}{s};{s}{s}`{s} over {s}`{s}{s}const{s} {s} = {s}T{s}{{}}{s};{s}{s}`{s}", .{ d, r, p, r, context, d, r, m, r, d, r, d, r, d, r, p, r, context, m, r, d, r, d, r }),
+            .Z004 => {
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const name = context[0..sep];
+                const type_name = if (sep < context.len) context[sep + 1 ..] else "the explicit type";
+                try writer.print("prefer type annotation {s}'{s}'{s} with an anonymous initializer for {s}'{s}'{s}; preserve the declaration kind, modifiers, and fields", .{
+                    m, type_name, r, y, name, r,
+                });
+            },
             .Z005 => try writer.print("type function {s}'{s}'{s} should be PascalCase", .{ y, context, r }),
             .Z006 => try writer.print("variable {s}'{s}'{s} should be snake_case", .{ y, context, r }),
             .Z007 => try writer.print("duplicate import {s}'{s}'{s}", .{ y, context, r }),
@@ -367,4 +372,16 @@ test "Z003 includes the parser error" {
     try Rule.Z003.writeMessage(&output.writer, "expected expression", false);
 
     try std.testing.expectEqualStrings("parse error: expected expression", output.written());
+}
+
+test "Z004 recommends preserving the declaration" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z004.writeMessage(&output.writer, "point\x00Point", false);
+
+    try std.testing.expectEqualStrings(
+        "prefer type annotation 'Point' with an anonymous initializer for 'point'; preserve the declaration kind, modifiers, and fields",
+        output.written(),
+    );
 }
