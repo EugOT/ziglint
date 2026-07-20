@@ -284,8 +284,19 @@ fn collectAllIdentifiers(self: *Linter) void {
 
 fn checkParseErrors(self: *Linter) void {
     for (self.tree.errors) |err| {
-        const loc = self.tree.tokenLocation(0, err.token);
-        self.report(loc, .Z003, "");
+        var message: std.Io.Writer.Allocating = .init(self.allocator);
+        defer message.deinit();
+        self.tree.renderError(err, &message.writer) catch continue;
+
+        const context = message.toOwnedSlice() catch continue;
+        self.allocated_contexts.append(self.allocator, context) catch {
+            self.allocator.free(context);
+            continue;
+        };
+
+        var loc = self.tree.tokenLocation(0, err.token);
+        loc.column += self.tree.errorOffset(err);
+        self.report(loc, .Z003, context);
     }
 }
 
@@ -2977,6 +2988,7 @@ test "Z003: detect parse error" {
     linter.lint();
     try std.testing.expect(linter.diagnostics.items.len > 0);
     try std.testing.expectEqual(rules.Rule.Z003, linter.diagnostics.items[0].rule);
+    try std.testing.expect(linter.diagnostics.items[0].context.len > 0);
 }
 
 test "Z003: valid code no parse error" {

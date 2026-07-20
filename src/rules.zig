@@ -91,7 +91,10 @@ pub const Rule = enum(u16) {
         switch (self) {
             .Z001 => try writer.print("function {s}'{s}'{s} should be camelCase", .{ y, context, r }),
             .Z002 => try writer.print("initialized variable {s}'{s}'{s} uses a named discard; rename it if used or write {s}`_ = expression;`{s} to discard the value", .{ y, context, r, d, r }),
-            .Z003 => try writer.writeAll("parse error"),
+            .Z003 => {
+                try writer.writeAll("parse error");
+                if (context.len > 0) try writer.print(": {s}", .{context});
+            },
             // syntax highlight: `const name: T = .{};` vs `const name = T{};`
             // const=purple (keyword), name=yellow (identifier), T=magenta (type)
             .Z004 => try writer.print("prefer {s}`{s}{s}const{s} {s}{s}:{s} {s}T{s} = .{{}}{s};{s}{s}`{s} over {s}`{s}{s}const{s} {s} = {s}T{s}{{}}{s};{s}{s}`{s}", .{ d, r, p, r, context, d, r, m, r, d, r, d, r, d, r, p, r, context, m, r, d, r, d, r }),
@@ -355,4 +358,13 @@ test "Z002 recommends valid fixes for named discards" {
         "initialized variable '_result' uses a named discard; rename it if used or write `_ = expression;` to discard the value",
         output.written(),
     );
+}
+
+test "Z003 includes the parser error" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z003.writeMessage(&output.writer, "expected expression", false);
+
+    try std.testing.expectEqualStrings("parse error: expected expression", output.written());
 }
