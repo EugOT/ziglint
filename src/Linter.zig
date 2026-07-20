@@ -686,8 +686,9 @@ fn checkInlineImports(self: *Linter) void {
                     if (self.tree.nodeTag(lhs) == .identifier) {
                         const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
                         if (std.mem.eql(u8, lhs_name, "_")) {
-                            // Discarding import is allowed
-                            break;
+                            // Discard imports are only used to pull declarations
+                            // into a test build.
+                            if (self.isInTestBlock(parent)) break;
                         }
                     }
                     const loc = self.tree.tokenLocation(0, main_token);
@@ -6015,6 +6016,17 @@ test "Z028: allow discard import for pulling in tests" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: disallow discard import in function" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn load() void {
+        \\    _ = @import("other.zig");
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
 }
 
 test "Z028: allow const import in test block" {
