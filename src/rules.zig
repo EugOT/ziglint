@@ -90,7 +90,7 @@ pub const Rule = enum(u16) {
 
         switch (self) {
             .Z001 => try writer.print("function {s}'{s}'{s} should be camelCase", .{ y, context, r }),
-            .Z002 => try writer.print("variable {s}'{s}'{s} is unused but has a value", .{ y, context, r }),
+            .Z002 => try writer.print("initialized variable {s}'{s}'{s} uses a named discard; rename it if used or write {s}`_ = expression;`{s} to discard the value", .{ y, context, r, d, r }),
             .Z003 => try writer.writeAll("parse error"),
             // syntax highlight: `const name: T = .{};` vs `const name = T{};`
             // const=purple (keyword), name=yellow (identifier), T=magenta (type)
@@ -341,6 +341,18 @@ test "Z017 recommends a coercion-preserving rewrite" {
 
     try std.testing.expectEqualStrings(
         "avoid try in return; hoist it to preserve payload coercion: `const value = try allocThing(); return value;`",
+        output.written(),
+    );
+}
+
+test "Z002 recommends valid fixes for named discards" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z002.writeMessage(&output.writer, "_result", false);
+
+    try std.testing.expectEqualStrings(
+        "initialized variable '_result' uses a named discard; rename it if used or write `_ = expression;` to discard the value",
         output.written(),
     );
 }

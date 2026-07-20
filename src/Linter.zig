@@ -2939,7 +2939,7 @@ test "Z001: allow single lowercase letter" {
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z001));
 }
 
-test "Z002: detect unused variable with value" {
+test "Z002: detect initialized named discard" {
     var linter: Linter = .init(std.testing.allocator, "fn foo() void { const _x = 1; }", "test.zig", null);
     defer linter.deinit();
     linter.lint();
@@ -2947,12 +2947,19 @@ test "Z002: detect unused variable with value" {
 }
 
 test "Z002: allow plain discard _" {
-    var linter: Linter = .init(std.testing.allocator, "fn foo() void { const _ = bar(); }", "test.zig", null);
+    var linter: Linter = .init(std.testing.allocator, "fn foo() void { _ = bar(); }", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z002);
     }
+}
+
+test "Z002: detect used initialized variable with underscore prefix" {
+    var linter: Linter = .init(std.testing.allocator, "fn foo() u32 { const _x = 1; return _x; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z002));
 }
 
 test "Z002: allow double underscore __" {

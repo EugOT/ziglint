@@ -24,7 +24,7 @@ Directories are scanned recursively for `.zig` files.
 | Code | Description |
 |------|-------------|
 | Z001 | Function names should be camelCase |
-| Z002 | Unused variable that has a value |
+| Z002 | Avoid initialized variables that look like named discards |
 | Z003 | Parse error |
 | Z004 | Prefer `const x: T = .{}` over `const x = T{}` |
 | Z005 | Type function names should be PascalCase |
