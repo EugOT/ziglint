@@ -151,9 +151,12 @@ pub const Rule = enum(u16) {
             .Z019 => {
                 try writer.print("{s}@This(){s} used in named struct; use {s}'{s}'{s} instead", .{ b, r, y, context, r });
             },
-            // inline @This() - assign to a constant
             .Z020 => {
-                try writer.print("{s}@This(){s} should be assigned to a constant", .{ b, r });
+                if (context.len > 0) {
+                    try writer.print("inline {s}@This(){s} in named struct; use {s}'{s}'{s} instead", .{ b, r, y, context, r });
+                } else {
+                    try writer.print("inline {s}@This(){s}; assign it to {s}`const Self = @This();`{s}", .{ b, r, d, r });
+                }
             },
             // file-struct @This() alias should match filename
             // context is "alias\x00expected" format
@@ -384,4 +387,22 @@ test "Z004 recommends preserving the declaration" {
         "prefer type annotation 'Point' with an anonymous initializer for 'point'; preserve the declaration kind, modifiers, and fields",
         output.written(),
     );
+}
+
+test "Z020 recommends the enclosing named struct" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z020.writeMessage(&output.writer, "Widget", false);
+
+    try std.testing.expectEqualStrings("inline @This() in named struct; use 'Widget' instead", output.written());
+}
+
+test "Z020 recommends Self for an anonymous struct" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z020.writeMessage(&output.writer, "", false);
+
+    try std.testing.expectEqualStrings("inline @This(); assign it to `const Self = @This();`", output.written());
 }

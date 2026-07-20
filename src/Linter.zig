@@ -550,7 +550,7 @@ fn checkThisBuiltin(self: *Linter) void {
         // Check 1: Is it in the form `const X = @This();`?
         const parent = self.parent_map[@intFromEnum(node)].unwrap() orelse {
             // Z020: inline @This()
-            self.report(loc, .Z020, "");
+            self.report(loc, .Z020, self.findEnclosingStructName(node) orelse "");
             continue;
         };
 
@@ -577,7 +577,7 @@ fn checkThisBuiltin(self: *Linter) void {
 
         if (const_decl_info == null) {
             // Z020: inline @This()
-            self.report(loc, .Z020, "");
+            self.report(loc, .Z020, self.findEnclosingStructName(node) orelse "");
             continue;
         }
 
@@ -790,7 +790,7 @@ fn findEnclosingStructName(self: *Linter, start_node: Ast.Node.Index) ?[]const u
         current = parent;
     }
 
-    const container = enclosing_container orelse return null;
+    const container = enclosing_container orelse return self.findContainingTopLevelStructName(start_node);
 
     // Second pass: check if container is inside a function/test block
     // If so, the struct name isn't accessible from inside, so @This() is valid
@@ -820,6 +820,19 @@ fn findEnclosingStructName(self: *Linter, start_node: Ast.Node.Index) ?[]const u
         },
         else => null, // Anonymous (returned, passed as arg, etc.)
     };
+}
+
+fn findContainingTopLevelStructName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    const node_token = self.tree.nodeMainToken(node);
+    for (self.tree.rootDecls()) |decl| {
+        const var_decl = self.tree.fullVarDecl(decl) orelse continue;
+        const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+        var buf: [2]Ast.Node.Index = undefined;
+        _ = self.tree.fullContainerDecl(&buf, init_node) orelse continue;
+        if (node_token < self.tree.firstToken(init_node) or node_token > self.tree.lastToken(init_node)) continue;
+        return self.tree.tokenSlice(var_decl.ast.mut_token + 1);
+    }
+    return null;
 }
 
 /// Find the enclosing container (struct/union/enum) for a given node
@@ -4695,9 +4708,28 @@ test "Z020: inline @This() should warn" {
     linter.lint();
     var found = false;
     for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z020) found = true;
+        if (d.rule == rules.Rule.Z020) {
+            found = true;
+            try std.testing.expectEqualStrings("Foo", d.context);
+        }
     }
     try std.testing.expect(found);
+}
+
+test "Z020: inline @This() in anonymous struct recommends Self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn Wrapper() type {
+        \\    return struct { fn method() @This() { return undefined; } };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z020));
+    for (linter.diagnostics.items) |diagnostic| {
+        if (diagnostic.rule == .Z020) {
+            try std.testing.expectEqualStrings("", diagnostic.context);
+        }
+    }
 }
 
 test "Z020: @This() as function argument is ok" {
