@@ -2944,7 +2944,7 @@ fn checkLineLength(self: *Linter) void {
 
     for (self.source, 0..) |c, i| {
         if (c == '\n') {
-            const line_len = i - line_start;
+            const line_len = sourceLineByteLength(self.source, line_start, i);
             if (line_len > max_len) {
                 // Format: "actual_len\x00max_len" for the error message
                 const context = std.fmt.allocPrint(self.allocator, "{}\x00{}", .{ line_len, max_len }) catch continue;
@@ -2961,7 +2961,7 @@ fn checkLineLength(self: *Linter) void {
 
     // Check last line if not terminated with newline
     if (line_start < self.source.len) {
-        const line_len = self.source.len - line_start;
+        const line_len = sourceLineByteLength(self.source, line_start, self.source.len);
         if (line_len > max_len) {
             const context = std.fmt.allocPrint(self.allocator, "{}\x00{}", .{ line_len, max_len }) catch return;
             self.allocated_contexts.append(self.allocator, context) catch {
@@ -2971,6 +2971,11 @@ fn checkLineLength(self: *Linter) void {
             self.reportLineLength(line_num, context, max_len);
         }
     }
+}
+
+fn sourceLineByteLength(source: []const u8, start: usize, end: usize) usize {
+    const content_end = if (end > start and source[end - 1] == '\r') end - 1 else end;
+    return content_end - start;
 }
 
 fn reportLineLength(self: *Linter, line: usize, context: []const u8, max_len: u32) void {
@@ -5118,8 +5123,8 @@ test "Z023: comptime value after other is bad" {
     try std.testing.expect(found);
 }
 
-test "Z024: detect line exceeding 120 characters" {
-    // Line with 121 characters (11 + 108 + 2)
+test "Z024: detect line exceeding 120 bytes" {
+    // Line with 121 bytes (11 + 108 + 2)
     var linter: Linter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
@@ -5130,17 +5135,24 @@ test "Z024: detect line exceeding 120 characters" {
     try std.testing.expect(found);
 }
 
-test "Z024: allow line with exactly 120 characters" {
-    // Line with exactly 120 characters (11 + 107 + 2)
+test "Z024: allow line with exactly 120 bytes" {
+    // Line with exactly 120 bytes (11 + 107 + 2)
     var linter: Linter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     for (linter.diagnostics.items) |d| {
         if (d.rule == rules.Rule.Z024) {
-            // Should not find Z024 for exactly 120 characters
+            // Should not find Z024 for exactly 120 bytes
             try std.testing.expect(false);
         }
     }
+}
+
+test "Z024: do not count CRLF terminator" {
+    var linter: Linter = .init(std.testing.allocator, "const x = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\r\n", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z024));
 }
 
 test "Z024: allow short line" {

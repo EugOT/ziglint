@@ -184,7 +184,7 @@ pub const Rule = enum(u16) {
                 const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
                 const actual = context[0..sep];
                 const max = if (sep < context.len) context[sep + 1 ..] else "120";
-                try writer.print("line exceeds {s}{s}{s} characters ({s}{s}{s} chars)", .{ y, max, r, y, actual, r });
+                try writer.print("line exceeds {s}{s}{s} bytes ({s}{s}{s} bytes)", .{ y, max, r, y, actual, r });
             },
             // redundant catch: `catch |err| return err` -> use `try`
             // catch=purple, try=purple, expr=yellow, punctuation=dim
