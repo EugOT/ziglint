@@ -219,10 +219,12 @@ pub const Rule = enum(u16) {
                 });
             },
             .Z030 => {
-                // context is "reason" - either "has early return" or "missing assignment"
-                try writer.print("{s}deinit{s} should set {s}self.* = undefined{s}", .{ y, r, b, r });
-                if (context.len > 0) {
-                    try writer.print(" ({s})", .{context});
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const param_name = context[0..sep];
+                const reason = if (sep < context.len) context[sep + 1 ..] else "";
+                try writer.print("{s}deinit{s} should set {s}{s}.* = undefined{s}", .{ y, r, b, param_name, r });
+                if (reason.len > 0) {
+                    try writer.print(" ({s})", .{reason});
                 }
             },
             .Z031 => {
@@ -415,6 +417,18 @@ test "Z021 includes both accepted aliases" {
 
     try std.testing.expectEqualStrings(
         "@This() alias 'Wrong' should match filename 'Config' or be 'Self'",
+        output.written(),
+    );
+}
+
+test "Z030 uses the receiver name" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z030.writeMessage(&output.writer, "value\x00has early return before invalidation", false);
+
+    try std.testing.expectEqualStrings(
+        "deinit should set value.* = undefined (has early return before invalidation)",
         output.written(),
     );
 }

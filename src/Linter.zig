@@ -1639,10 +1639,10 @@ fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.
     // Check for `defer self.* = undefined;` anywhere in body - this handles all paths
     if (self.hasDeferSelfUndefined(body_node, param_name)) return;
 
-    // Check for early returns (which would skip final self.* = undefined)
-    if (self.hasEarlyReturn(body_node)) {
+    // Check for returns reached before this receiver is invalidated.
+    if (self.hasUnsafeReturn(body_node, param_name, false)) {
         const loc = self.tree.tokenLocation(0, name_token);
-        self.report(loc, .Z030, "has early return without defer");
+        self.reportDeinitUndefined(loc, param_name, "has early return before invalidation");
         return;
     }
 
@@ -1651,7 +1651,16 @@ fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.
 
     // None of the valid patterns found
     const loc = self.tree.tokenLocation(0, name_token);
-    self.report(loc, .Z030, "");
+    self.reportDeinitUndefined(loc, param_name, "");
+}
+
+fn reportDeinitUndefined(self: *Linter, loc: Ast.Location, param_name: []const u8, reason: []const u8) void {
+    const context = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ param_name, reason }) catch return;
+    self.allocated_contexts.append(self.allocator, context) catch {
+        self.allocator.free(context);
+        return;
+    };
+    self.report(loc, .Z030, context);
 }
 
 fn isPointerType(self: *Linter, node: Ast.Node.Index) bool {
@@ -1676,37 +1685,25 @@ fn hasDeferSelfUndefined(self: *Linter, body_node: Ast.Node.Index, param_name: [
     return false;
 }
 
-fn hasEarlyReturn(self: *Linter, body_node: Ast.Node.Index) bool {
-    var buf: [2]Ast.Node.Index = undefined;
-    const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
-
-    // Check all statements except the last one for returns
-    if (stmts.len <= 1) return false;
-
-    for (stmts[0 .. stmts.len - 1]) |stmt| {
-        if (self.containsReturn(stmt)) return true;
-    }
-    return false;
-}
-
-fn containsReturn(self: *Linter, node: Ast.Node.Index) bool {
+fn hasUnsafeReturn(self: *Linter, node: Ast.Node.Index, param_name: []const u8, invalidated_before: bool) bool {
     const tag = self.tree.nodeTag(node);
-    if (tag == .@"return") return true;
+    if (tag == .@"return") return !invalidated_before;
 
-    // Recursively check children for returns (e.g., in if blocks)
     switch (tag) {
         .@"if", .if_simple => {
             const full_if = self.tree.fullIf(node) orelse return false;
-            if (self.containsReturn(full_if.ast.then_expr)) return true;
+            if (self.hasUnsafeReturn(full_if.ast.then_expr, param_name, invalidated_before)) return true;
             if (full_if.ast.else_expr.unwrap()) |else_node| {
-                if (self.containsReturn(else_node)) return true;
+                if (self.hasUnsafeReturn(else_node, param_name, invalidated_before)) return true;
             }
         },
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
             var block_buf: [2]Ast.Node.Index = undefined;
             const block_stmts = self.tree.blockStatements(&block_buf, node) orelse return false;
+            var invalidated = invalidated_before;
             for (block_stmts) |stmt| {
-                if (self.containsReturn(stmt)) return true;
+                if (self.hasUnsafeReturn(stmt, param_name, invalidated)) return true;
+                if (self.isSelfUndefinedAssign(stmt, param_name)) invalidated = true;
             }
         },
         else => {},
@@ -6125,6 +6122,24 @@ test "Z030: allow early return with defer" {
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
 }
 
+test "Z030: allow early return after branch invalidation" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        if (self.a == 0) {
+        \\            self.* = undefined;
+        \\            return;
+        \\        }
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
 test "Z030: skip non-pointer receiver deinit" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Foo = struct {
@@ -6165,6 +6180,22 @@ test "Z030: handle different self parameter names" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: diagnostic uses receiver parameter name" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(value: *Foo) void { _ = value; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+    for (linter.diagnostics.items) |diagnostic| {
+        if (diagnostic.rule == .Z030) {
+            try std.testing.expectEqualStrings("value\x00", diagnostic.context);
+        }
+    }
 }
 
 test "Z031: detect underscore prefix in function" {
