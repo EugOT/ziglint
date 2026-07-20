@@ -126,12 +126,10 @@ pub const Rule = enum(u16) {
                     d, r, b, r, d, r, y, r, d, r, b, r, d, r, y, r, d, r,
                 });
             },
-            // return=purple, try=purple, expr=yellow, punctuation=dim
-            // `return try expr` -> `return expr`
+            // return/try/const=purple, expr/value=yellow, punctuation=dim
             .Z017 => {
-                // redundant `try` in `return`: `return try expr` -> `return expr`
-                try writer.print("redundant {s}try{s} in {s}return{s}: {s}`{s}return try {s}{s}{s}`{s} -> {s}`{s}return {s}{s}{s}`{s}", .{
-                    p, r, p, r, d, r, y, context, d, r, d, r, y, context, d, r,
+                try writer.print("avoid {s}try{s} in {s}return{s}; hoist it to preserve payload coercion: {s}`{s}{s}const{s} {s}value{s} = {s}try{s} {s}{s}{s}; {s}return{s} {s}value{s};{s}`{s}", .{
+                    p, r, p, r, d, r, p, r, y, r, p, r, y, context, d, p, r, y, r, d, r,
                 });
             },
             // redundant @as when type is already known from context
@@ -333,4 +331,16 @@ fn RuleConfig(comptime enabled_by_default: bool, comptime Extra: type) type {
 
 test "rule codes" {
     try std.testing.expectEqualStrings("Z001", Rule.Z001.code());
+}
+
+test "Z017 recommends a coercion-preserving rewrite" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z017.writeMessage(&output.writer, "allocThing()", false);
+
+    try std.testing.expectEqualStrings(
+        "avoid try in return; hoist it to preserve payload coercion: `const value = try allocThing(); return value;`",
+        output.written(),
+    );
 }

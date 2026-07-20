@@ -203,8 +203,8 @@ fn resolveImportPath(self: *ModuleGraph, import_str: []const u8, module_path: []
     // Handle "std" import - add it to the graph but don't recurse into its imports
     if (std.mem.eql(u8, import_str, "std")) {
         const lib_path = self.zig_lib_path orelse return null;
-        // ziglint-ignore: Z017 (false positive: join returns ![]u8 but function returns !?[]const u8)
-        return try std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" });
+        const path = try std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" });
+        return path;
     }
 
     // Handle builtin (skip it)
@@ -224,8 +224,8 @@ fn resolveImportPath(self: *ModuleGraph, import_str: []const u8, module_path: []
     // Handle relative .zig imports
     if (std.mem.endsWith(u8, import_str, ".zig")) {
         const module_dir = std.fs.path.dirname(module_path) orelse ".";
-        // ziglint-ignore: Z017 (false positive: join returns ![]u8 but function returns !?[]const u8)
-        return try std.fs.path.join(self.allocator, &.{ module_dir, import_str });
+        const path = try std.fs.path.join(self.allocator, &.{ module_dir, import_str });
+        return path;
     }
 
     return null;
