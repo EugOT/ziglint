@@ -2400,17 +2400,8 @@ fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
     var buf: [1]Ast.Node.Index = undefined;
     const call = self.tree.fullCall(&buf, node) orelse return;
 
-    // Check if this is a call to "assert"
     const fn_expr = call.ast.fn_expr;
-    const is_assert = switch (self.tree.nodeTag(fn_expr)) {
-        .identifier => std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(fn_expr)), "assert"),
-        .field_access => blk: {
-            const data = self.tree.nodeData(fn_expr).node_and_token;
-            break :blk std.mem.eql(u8, self.tree.tokenSlice(data[1]), "assert");
-        },
-        else => false,
-    };
-    if (!is_assert) return;
+    if (!self.isStdDebugAssert(fn_expr)) return;
 
     // Check if argument is a compound bool_and or bool_or
     if (call.ast.params.len == 0) return;
@@ -2422,6 +2413,59 @@ fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
 
     const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
     self.report(loc, .Z016, "and");
+}
+
+fn isStdDebugAssert(self: *Linter, node: Ast.Node.Index) bool {
+    if (self.isStdDebugAssertField(node)) return true;
+    if (self.tree.nodeTag(node) != .identifier) return false;
+
+    const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+    for (self.tree.rootDecls()) |decl| {
+        const var_decl = self.tree.fullVarDecl(decl) orelse continue;
+        const name_token = var_decl.ast.mut_token + 1;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) continue;
+        const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+        return self.isStdDebugAssertField(init_node);
+    }
+    return false;
+}
+
+fn isStdDebugAssertField(self: *Linter, node: Ast.Node.Index) bool {
+    if (self.tree.nodeTag(node) != .field_access) return false;
+    const assert_access = self.tree.nodeData(node).node_and_token;
+    if (!std.mem.eql(u8, self.tree.tokenSlice(assert_access[1]), "assert")) return false;
+
+    const debug_node = assert_access[0];
+    if (self.tree.nodeTag(debug_node) != .field_access) return false;
+    const debug_access = self.tree.nodeData(debug_node).node_and_token;
+    if (!std.mem.eql(u8, self.tree.tokenSlice(debug_access[1]), "debug")) return false;
+
+    return self.isStdImport(debug_access[0]);
+}
+
+fn isStdImport(self: *Linter, node: Ast.Node.Index) bool {
+    if (self.tree.nodeTag(node) == .identifier) {
+        const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+        for (self.tree.rootDecls()) |decl| {
+            const var_decl = self.tree.fullVarDecl(decl) orelse continue;
+            const name_token = var_decl.ast.mut_token + 1;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) continue;
+            const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+            return self.isDirectStdImport(init_node);
+        }
+        return false;
+    }
+
+    return self.isDirectStdImport(node);
+}
+
+fn isDirectStdImport(self: *Linter, node: Ast.Node.Index) bool {
+    const main_token = self.tree.nodeMainToken(node);
+    if (!std.mem.eql(u8, self.tree.tokenSlice(main_token), "@import")) return false;
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = self.tree.builtinCallParams(&buf, node) orelse return false;
+    if (params.len != 1) return false;
+    return std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(params[0])), "\"std\"");
 }
 
 fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
@@ -4467,6 +4511,36 @@ test "Z016: simple assert is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z016);
     }
+}
+
+test "Z016: user-defined assert is not rewritten" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn assert(value: bool) void { _ = value; }
+        \\fn check(a: bool, b: bool) void { assert(a and b); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z016));
+}
+
+test "Z016: user-defined assert method is not rewritten" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Recorder = struct { fn assert(value: bool) void { _ = value; } };
+        \\fn check(a: bool, b: bool) void { Recorder.assert(a and b); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z016));
+}
+
+test "Z016: detect std debug assert alias" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const assert = @import("std").debug.assert;
+        \\fn check(a: bool, b: bool) void { assert(a and b); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z016));
 }
 
 test "Z017: detect try in return" {
