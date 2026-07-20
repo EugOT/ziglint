@@ -1096,17 +1096,17 @@ fn isBuiltinType(name: []const u8) bool {
 
 const ParamKind = enum {
     type_param,
+    comptime_value,
     allocator,
     io,
-    comptime_value,
     other,
 
     fn order(self: ParamKind) u8 {
         return switch (self) {
             .type_param => 0,
-            .allocator => 1,
-            .io => 2,
-            .comptime_value => 3,
+            .comptime_value => 1,
+            .allocator => 2,
+            .io => 3,
             .other => 4,
         };
     }
@@ -1176,10 +1176,8 @@ fn classifyParam(self: *Linter, param: Ast.full.FnProto.Param) ParamKind {
     const type_node = param.type_expr orelse return .other;
     const base_kind = self.classifyTypeNode(type_node);
 
-    // If it's a comptime param that's not a type param, classify as comptime_value
-    if (base_kind == .other and self.isComptimeParam(param)) {
-        return .comptime_value;
-    }
+    if (base_kind == .type_param) return .type_param;
+    if (self.isComptimeParam(param)) return .comptime_value;
 
     return base_kind;
 }
@@ -4874,8 +4872,8 @@ test "Z023: argument order - io before allocator" {
 test "Z023: argument order - correct order is ok" {
     var linter: Linter = .init(std.testing.allocator,
         \\const std = @import("std");
-        \\fn good(comptime T: type, allocator: std.mem.Allocator, io: std.Io, value: u32) void {
-        \\    _ = .{ T, allocator, io, value };
+        \\fn good(comptime T: type, comptime size: usize, allocator: std.mem.Allocator, io: std.Io, value: u32) void {
+        \\    _ = .{ T, size, allocator, io, value };
         \\}
     , "test.zig", null);
     defer linter.deinit();
@@ -5079,11 +5077,23 @@ test "Z023: multiple violations reported" {
     try std.testing.expect(count >= 2);
 }
 
-test "Z023: comptime value after allocator is ok" {
+test "Z023: comptime value after allocator is bad" {
     var linter: Linter = .init(std.testing.allocator,
         \\const std = @import("std");
-        \\fn good(alloc: std.mem.Allocator, comptime size: usize) void {
+        \\fn bad(alloc: std.mem.Allocator, comptime size: usize) void {
         \\    _ = .{ alloc, size };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z023));
+}
+
+test "Z023: comptime value before allocator is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn good(comptime size: usize, alloc: std.mem.Allocator) void {
+        \\    _ = .{ size, alloc };
         \\}
     , "test.zig", null);
     defer linter.deinit();
@@ -5093,23 +5103,7 @@ test "Z023: comptime value after allocator is ok" {
     }
 }
 
-test "Z023: comptime value before allocator is bad" {
-    var linter: Linter = .init(std.testing.allocator,
-        \\const std = @import("std");
-        \\fn bad(comptime size: usize, alloc: std.mem.Allocator) void {
-        \\    _ = .{ size, alloc };
-        \\}
-    , "test.zig", null);
-    defer linter.deinit();
-    linter.lint();
-    var found = false;
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z023) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "Z023: comptime value before other is bad" {
+test "Z023: comptime value after other is bad" {
     var linter: Linter = .init(std.testing.allocator,
         \\fn bad(value: u32, comptime size: usize) void {
         \\    _ = .{ value, size };
