@@ -2252,10 +2252,29 @@ fn findContainerFieldTypeInTree(self: *Linter, tree: *const Ast, struct_type_nam
 }
 
 fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
-    var buf: [1]Ast.Node.Index = undefined;
-    const call = self.tree.fullCall(&buf, node) orelse return;
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&call_buf, node) orelse return;
+    const resolved = self.resolveCalledFnProto(call.ast.fn_expr) orelse return;
+
+    var fn_buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = resolved.tree.fullFnProto(&fn_buf, resolved.fn_node) orelse return;
+    var param_it = fn_proto.iterate(resolved.tree);
+    if (self.tree.nodeTag(call.ast.fn_expr) == .field_access) _ = param_it.next();
+
     for (call.ast.params) |arg| {
-        // Don't check field_access in call args - can't distinguish type params from enum values
+        const param = param_it.next() orelse break;
+        const param_type = param.type_expr orelse continue;
+
+        var struct_buf: [2]Ast.Node.Index = undefined;
+        const struct_init = self.tree.fullStructInit(&struct_buf, arg) orelse continue;
+        const arg_type = struct_init.ast.type_expr.unwrap() orelse continue;
+
+        // Anonymous initialization is only safe when the parameter provides the
+        // same concrete result type. Generic and unresolved calls are skipped.
+        const arg_type_source = self.getNodeSource(arg_type);
+        const param_type_source = getNodeSourceFromTree(resolved.tree, param_type);
+        if (!std.mem.eql(u8, arg_type_source, param_type_source)) continue;
+
         self.checkRedundantType(arg, false);
     }
 }
@@ -2454,12 +2473,16 @@ fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: b
 }
 
 fn getNodeSource(self: *Linter, node: Ast.Node.Index) []const u8 {
-    const token_starts = self.tree.tokens.items(.start);
-    const first_token = self.tree.firstToken(node);
-    const last_token = self.tree.lastToken(node);
+    return getNodeSourceFromTree(&self.tree, node);
+}
+
+fn getNodeSourceFromTree(tree: *const Ast, node: Ast.Node.Index) []const u8 {
+    const token_starts = tree.tokens.items(.start);
+    const first_token = tree.firstToken(node);
+    const last_token = tree.lastToken(node);
     const start = token_starts[first_token];
-    const end = token_starts[last_token] + self.tree.tokenSlice(last_token).len;
-    return self.source[start..end];
+    const end = token_starts[last_token] + tree.tokenSlice(last_token).len;
+    return tree.source[start..end];
 }
 
 fn truncateExpr(expr: []const u8) []const u8 {
@@ -3503,6 +3526,28 @@ test "Z010: detect explicit struct in function arg" {
 
 test "Z010: allow anonymous struct in function arg" {
     var linter: Linter = .init(std.testing.allocator, "fn bar(x: Foo) void {} fn foo() void { bar(.{}); }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow explicit struct in anytype function arg" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {};
+        \\fn consume(value: anytype) void { _ = value; }
+        \\fn useFoo() void { consume(Foo{}); }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
+test "Z010: allow explicit struct in generic function arg" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {};
+        \\fn consume(comptime T: type, value: T) void { _ = value; }
+        \\fn useFoo() void { consume(Foo, Foo{}); }
+    , "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
