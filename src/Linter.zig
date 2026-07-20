@@ -2383,10 +2383,15 @@ fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: A
 }
 
 fn containsDeprecated(text: []const u8) bool {
-    var i: usize = 0;
-    while (i + 10 <= text.len) : (i += 1) {
-        const slice = text[i .. i + 10];
-        if (std.ascii.eqlIgnoreCase(slice, "deprecated")) return true;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (std.ascii.startsWithIgnoreCase(line, "deprecated")) {
+            if (line.len == "deprecated".len) return true;
+            const separator = line["deprecated".len];
+            if (separator == ':' or separator == ';' or separator == '.' or separator == ' ') return true;
+        }
+        if (std.ascii.startsWithIgnoreCase(line, "this function is deprecated")) return true;
     }
     return false;
 }
@@ -4104,10 +4109,13 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
 
 test "containsDeprecated" {
     try std.testing.expect(containsDeprecated("Deprecated: use X instead"));
-    try std.testing.expect(containsDeprecated("deprecated function"));
-    try std.testing.expect(containsDeprecated("This is DEPRECATED"));
+    try std.testing.expect(containsDeprecated("deprecated; use X instead"));
+    try std.testing.expect(containsDeprecated("Summary\nDeprecated in favor of X"));
+    try std.testing.expect(containsDeprecated("This function is deprecated; use X"));
     try std.testing.expect(!containsDeprecated("This function is useful"));
-    try std.testing.expect(!containsDeprecated("deprecat")); // too short
+    try std.testing.expect(!containsDeprecated("This function is not deprecated"));
+    try std.testing.expect(!containsDeprecated("Handles deprecated data formats"));
+    try std.testing.expect(!containsDeprecated("deprecation details"));
 }
 
 test "Z012: pub fn returning private type" {
