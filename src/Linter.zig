@@ -1597,20 +1597,6 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
         }
     }
 
-    // Check for redundant words (disabled by default)
-    if (self.config.isRuleEnabled(.Z033)) {
-        if (findRedundantWord(name)) |word| {
-            const context = self.allocator.alloc(u8, name.len + 1 + word.len) catch return;
-            @memcpy(context[0..name.len], name);
-            context[name.len] = 0;
-            @memcpy(context[name.len + 1 ..], word);
-            // ziglint-ignore: Z026
-            self.allocated_contexts.append(self.allocator, context) catch {};
-            const loc = self.tree.tokenLocation(0, name_token);
-            self.report(loc, .Z033, context);
-        }
-    }
-
     self.checkExposedPrivateType(node);
     self.checkArgumentOrder(node);
     self.checkDeinitUndefined(node, fn_proto);
@@ -6306,12 +6292,15 @@ test "Z033: detect Context when enabled" {
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
 }
 
-test "Z033: detect utils when enabled" {
+test "Z033: allow vague words in function names" {
     const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
-    var linter: Linter = .init(std.testing.allocator, "fn stringUtils() void {}", "test.zig", &config);
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn processData() void {}
+        \\fn updateState() void {}
+    , "test.zig", &config);
     defer linter.deinit();
     linter.lint();
-    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z033));
 }
 
 test "Z033: allow normal names when enabled" {

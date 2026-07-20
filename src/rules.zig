@@ -44,7 +44,7 @@ pub const Rule = enum(u16) {
         const DisabledConfig = RuleConfig(false, struct {});
         return switch (self) {
             .Z024 => RuleConfig(true, struct { max_length: u32 = 120 }),
-            .Z033 => DisabledConfig, // Redundant name words - disabled by default
+            .Z033 => DisabledConfig, // Redundant type name words - disabled by default
             else => DefaultConfig,
         };
     }
@@ -246,7 +246,7 @@ pub const Rule = enum(u16) {
                 const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
                 const name = context[0..sep];
                 const word = if (sep < context.len) context[sep + 1 ..] else "";
-                try writer.print("identifier {s}'{s}'{s} contains redundant word {s}'{s}'{s}", .{ y, name, r, y, word, r });
+                try writer.print("type name {s}'{s}'{s} contains redundant word {s}'{s}'{s}", .{ y, name, r, y, word, r });
             },
         }
     }

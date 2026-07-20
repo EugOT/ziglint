@@ -54,7 +54,7 @@ Directories are scanned recursively for `.zig` files.
 | Z030 | `deinit` should set `self.* = undefined` |
 | Z031 | Avoid underscore prefix in identifiers |
 | Z032 | Acronyms should use standard casing |
-| Z033 | Avoid redundant words in identifiers (disabled by default) |
+| Z033 | Avoid redundant words in type names (disabled by default) |
 
 ## Configuration
 
